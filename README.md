@@ -1,21 +1,21 @@
 # Reorder git rebase -i commits safely
 
-The `move_sequencer_line.py` script can be used on a "git rebase todo list" to move a commit as far up or down as it can go in the sequence.
+The `htime.py` script can be used on a "git rebase todo list" to edit diffs safely, and to move a commit as far up or down as it can go in the sequence.
 
-The script takes three arguments:
+* `htime.py open "pick COMMIT"` - output the diff of `COMMIT`.
+* `htime.py update "pick COMMIT" "$(htime.py write "pick COMMIT" < patch)" < git-rebase-todo` - update git-rebase-todo, replacing the "pick COMMIT" line with a new line matching the diff in "patch".
+* `htime.py move <lineno> <'up'|'down'> < git-rebase-todo` - update git-rebase-todo, moving the given line (1-indexed) as far up or down as it can go.
 
-`python3 move_sequencer_line.py <'up'|'down'> <lineno> <git-rebase-todo-path>`
+The script's command-line interface is designed to be integrated into Vim, but hopefully the interface is general enough that the Vim-specific plugin can be easily ported to another editor.
 
-...where the first argument is whether to move the given line up or down,
-the second argument is the (1-indexed) line number of the line to move,
-and the third argument is the path to your `.git/rebase-merge/git-rebase-todo` file.
-
-If the third argument is `-`, the file is read from stdin and the result written on stdout.
-Otherwise, the file is read, modified, and written back out.
-
-If you use Vim, you can use the following autocommands to bind the script to `\j` and `\k`:
+To install the Vim plugin, add the following to your `.vimrc`:
 
 ```
-au FileType gitrebase nnoremap <buffer> <Leader>j :exec '%!python3 ~/work/hammertime/move_sequencer_line.py down '.line('.').' -'<CR>
-au FileType gitrebase nnoremap <buffer> <Leader>k :exec '%!python3 ~/work/hammertime/move_sequencer_line.py up '.line('.').' -'<CR>
+source ~/path/to/hammertime/vimplugin.vim
 ```
+
+The Vim plugin binds the following three keys in the `gitrebase` filetype (used for the git rebase todo list):
+
+* `\j` - move current line as far down as possible.
+* `\k` - move current line as far up as possible.
+* Enter - open the current line's diff in a new patch, which can be edited and saved with `:wq`.
