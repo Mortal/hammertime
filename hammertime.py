@@ -1,3 +1,10 @@
+"""Thin wrappers around the git command-line interface.
+
+Each public function shells out to git and parses its output; used by
+htime.py to manipulate commits, the index and HEAD. Set the
+DEBUG_GIT_COMMANDS environment variable to echo every git command run.
+"""
+
 import argparse
 import os
 import string
@@ -13,6 +20,7 @@ parser.add_argument("tip")
 
 
 def public[T](f: T) -> T:
+    """No-op marker decorator identifying a function as part of this module's API."""
     return f
 
 
@@ -30,6 +38,8 @@ class CommitNumstat:
 
 
 def _parse_numstat(cmdline: tuple[str, ...]) -> list[CommitNumstat]:
+    # Output format: one 40-hex-digit line per commit, followed by
+    # tab-separated "<added>\t<removed>\t<path>" lines ("-" for binary files).
     if DEBUG_GIT_COMMANDS:
         print(*cmdline, flush=True)
     numstat: list[Numstat] | None = None
@@ -108,7 +118,11 @@ def git_merge_file(*, current: str, base: str, other: str) -> tuple[str, int]:
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
+    # git merge-file exits 0 on success, 1..127 = number of conflicting
+    # hunks, and >127 indicates an error (e.g. a nonexistent object).
     if not 0 <= p.returncode <= 127:
+        # Retry, substituting an empty blob for any object that does not
+        # exist (e.g. a file added or deleted by one of the commits).
         zero_object = git_write_empty_blob()
         if git_rev_parse(current) is None:
             current = zero_object
@@ -311,9 +325,13 @@ def git_show_commit_message(refspec: str) -> str:
 
 @public
 def git_show_commit_author_timestamp_and_message(refspec: str) -> tuple[str, str]:
-    # Get the merge commit's timestamp (%aI) and full commit message (%B).
+    # Get the commit's author timestamp (%aI) and full commit message (%B).
     cmdline = ["git", "show", "-s", "--pretty=%aI %B", refspec]
     if DEBUG_GIT_COMMANDS:
         print("$", *cmdline, flush=True)
     output = subprocess.check_output(cmdline, text=True).strip()
-    return output.split(None, 1)
+    time_and_msg = output.split(None, 1)
+    if len(time_and_msg) == 1:
+        return output.strip(), ""
+    assert len(time_and_msg) == 2
+    return time_and_msg

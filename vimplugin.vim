@@ -1,7 +1,10 @@
+" Hammertime Vim plugin: buffers and key bindings for editing a git rebase
+" todo list with htime.py (see README.md). Loaded via :py3file below.
 let s:path = expand('<sfile>:p:h')
 
 exec 'py3file '..s:path..'/vimplugin.py'
 
+" Open the commit under the cursor in a new scratch buffer for hand-editing.
 function HtimeEdit()
 	let l:rebaseline = getline('.')
 	let l:rebasebuf = bufnr()
@@ -19,6 +22,8 @@ function HtimeEdit()
 	endif
 endfunction
 
+" On :w in the scratch buffer: feed the edited patch to "htime write",
+" then update the todo list buffer with the result of "htime update".
 function HtimeEditWrite()
 	let l:commitbuf = bufnr()
 	let l:commitwin = winnr()
@@ -35,7 +40,8 @@ function HtimeEditWrite()
 	endif
 endfunction
 
+" Key bindings in gitrebase buffers:
+" <Leader>j/k move the line down/up, Enter edits the commit's diff.
 au FileType gitrebase nnoremap <silent> <buffer> <Leader>j :py3 htime_move("down")<CR>
 au FileType gitrebase nnoremap <silent> <buffer> <Leader>k :py3 htime_move("up")<CR>
 au FileType gitrebase nnoremap <silent> <buffer> <CR> :call HtimeEdit()<CR>
-au FileType gitrebase nnoremap <silent> <buffer> <Leader>\ :py3 htime_cleanup()<CR>

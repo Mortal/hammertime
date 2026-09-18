@@ -1,3 +1,15 @@
+"""Helper for building a CLI from type-annotated functions.
+
+make_cliparser() returns a (subcommand, main) pair. Functions decorated
+with @subcommand gain an argparse subcommand whose arguments are derived
+from the function's parameter annotations:
+
+- Annotated[T, Arg(...)] / Annotated[T, Pos(...)] add option/positional metadata
+- Literal[...] becomes a choices argument
+- Optional[...] with a None default becomes an optional argument
+- bool (defaulting to False) becomes a store_true flag
+"""
+
 import argparse
 import functools
 import inspect
@@ -12,12 +24,16 @@ from typing import Annotated, Any, Literal
 
 @dataclass(frozen=True)
 class Pos:
+    """Annotation metadata: pass the parameter as a positional argument."""
+
     metavar: str
     help: str | None = None
 
 
 @dataclass(frozen=True)
 class Arg:
+    """Annotation metadata: override the option string (e.g. "-x"), help, metavar."""
+
     arg: str | None = None
     help: str | None = None
     metavar: str | None = None
@@ -26,6 +42,11 @@ class Arg:
 def make_cliparser(
     help: str, usage: str, fun_prefix: str
 ) -> tuple[Callable[[Callable[..., None]], None], Callable[[], None]]:
+    """Return (subcommand_decorator, main) for a CLI with the given usage string.
+
+    Decorated functions must be named fun_prefix + <subcommand name>; the
+    prefix is stripped to derive the subcommand name.
+    """
     parser = argparse.ArgumentParser(usage=usage, add_help=False)
     parser.add_argument("--help", "-h", action="store_true")
     subparsers = parser.add_subparsers(dest="command")
@@ -54,6 +75,8 @@ def make_cliparser(
 
         @functools.wraps(main_func)
         def wrapped(namespace: argparse.Namespace) -> None:
+            # Adapt the argparse Namespace back into positional/keyword
+            # arguments matching main_func's signature.
             args = []
             kwargs = {}
             for k, parm in signature.parameters.items():
@@ -128,7 +151,7 @@ def make_cliparser(
                 )
                 continue
 
-            help = arg_info.help if arg_info else None
+            help_text = arg_info.help if arg_info else None
             long = f"--{arg_name.replace('_', '-')}"
             arg = [long, arg_info.arg] if arg_info and arg_info.arg else [long]
             assert all(a.startswith("-") for a in arg)
@@ -142,7 +165,7 @@ def make_cliparser(
                     action="store_true",
                     dest=arg_name,
                     required=required,
-                    help=help,
+                    help=help_text,
                 )
                 continue
             subparser.add_argument(
@@ -153,7 +176,7 @@ def make_cliparser(
                 required=required,
                 default=default,
                 choices=choices,
-                help=help,
+                help=help_text,
             )
 
     return subcommand, main

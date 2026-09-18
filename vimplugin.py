@@ -1,3 +1,9 @@
+"""Vim plugin glue for htime.py (loaded from vimplugin.vim via :py3file).
+
+Exposes htime_move() and htime_cleanup() to Vim: each feeds the gitrebase
+todo buffer to htime.py on stdin and acts on its JSON output.
+"""
+
 import json
 import os
 import sys
@@ -13,6 +19,8 @@ this_dir = os.path.dirname(this_file)
 
 
 if "vim" not in globals():
+    # Stand-in for Vim's built-in `vim` module when this file is loaded
+    # outside Vim (e.g. for type checking); calls would fail at runtime.
 
     class vim:
         @staticmethod
@@ -23,6 +31,9 @@ if "vim" not in globals():
 
         class current:
             buffer = [""]
+
+            class window:
+                cursor = (1, 0)
 
 
 def htime_move(up_or_down: Literal["down", "up"]) -> None:
@@ -45,6 +56,9 @@ def htime_move(up_or_down: Literal["down", "up"]) -> None:
     )
     if proc.returncode:
         print(proc.stderr)
+        return
+    if not proc.stdout.strip():
+        print("(no output??)")
         return
     lastline = proc.stdout.splitlines()[-1]
     if lastline.startswith("{"):
@@ -72,24 +86,3 @@ def htime_move(up_or_down: Literal["down", "up"]) -> None:
                 vim.command(f"norm dd{endrow}GP")
         if "command" in cmd:
             vim.command(cmd["command"])
-
-
-def htime_cleanup() -> None:
-    cmdline = [
-        "time",
-        "python3",
-        os.path.join(this_dir, "htime.py"),
-        "cleanup",
-    ]
-    proc = subprocess.run(
-            cmdline,
-            check=False,
-            input="".join(f"{line}\n" for line in vim.current.buffer),
-            text=True,
-            capture_output=True,
-            )
-    if proc.returncode:
-        print(proc.stderr)
-        return
-    vim.current.buffer[:] = (proc.stderr + proc.stdout).splitlines()
-    print("DONE")

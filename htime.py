@@ -1,3 +1,10 @@
+"""Safely reorder and hand-edit commits in a git rebase todo list.
+
+See README.md for usage. Designed to be driven by an editor integration
+(see vimplugin.py / vimplugin.vim): the todo list is fed on stdin and the
+updated list (or a JSON result) is printed on stdout.
+"""
+
 import json
 import re
 import subprocess
@@ -31,6 +38,10 @@ subcommand, main = make_cliparser(__doc__, "htime", "htime_")
 
 @subcommand
 def htime_open(rebaseline: str) -> None:
+    """Print the commit's diff (git show) for hand-editing.
+
+    The hand-edited diff is fed back to the "write" subcommand.
+    """
     todo = parse_sequencer_line(rebaseline)
     assert todo is not None
     assert todo.oid
@@ -55,12 +66,20 @@ def htime_write(rebaseline: str) -> None:
 
 
 class TodoEdits(TypedDict):
+    """Edits to a rebase todo list, as produced by htime_write_inner.
+
+    replace:   line text that replaces the target line
+    justbelow: line to insert just below the target line
+    movedown:  line to move down until it no longer conflicts
+    """
+
     replace: NotRequired[str]
     justbelow: NotRequired[str]
     movedown: NotRequired[str]
 
 
 def parse_git_patch(thepatch: str) -> tuple[str, str]:
+    """Extract (commit hash, commit message) from hand-edited "git show" output."""
     if "\r" in thepatch:
         assert thepatch.count("\r\n") == thepatch.count("\r")
         thepatch = thepatch.replace("\r", "")
@@ -75,6 +94,14 @@ def parse_git_patch(thepatch: str) -> tuple[str, str]:
 
 
 def htime_write_inner(patchlines: str, oidlen: int) -> TodoEdits:
+    """Turn a hand-edited patch into replacement todo-list lines.
+
+    Rewinds HEAD to the commit's parent, applies the edited patch to the
+    index, and builds up to two "hammer" commits on top of the original:
+    one containing the hand-edits (squashed into the original commit via a
+    fixup line) and a revert of those edits (a plain pick inserted further
+    down the todo list) so that later commits still apply cleanly.
+    """
     if git_any_staged_changes():
         raise SystemExit("refuse to run when there are staged changes")
     commit_hash_patch, commit_msg = parse_git_patch(patchlines)
@@ -82,8 +109,6 @@ def htime_write_inner(patchlines: str, oidlen: int) -> TodoEdits:
     assert commit_hash
     head_sha = git_rev_parse("HEAD")
     assert head_sha
-    if commit_hash is None:
-        commit_hash = head_sha
     commit_msg_change = (
         commit_msg and git_show_commit_message(commit_hash) != commit_msg
     )
@@ -132,9 +157,6 @@ def htime_write_inner(patchlines: str, oidlen: int) -> TodoEdits:
             res = {"justbelow": f"f -C {hammer1} {subject}".rstrip()}
         else:
             res = {"justbelow": f"f {hammer1} {subject}".rstrip()}
-        if not edited_files:
-            print("No hand-edited files, just a commit message update")
-            return res
         git_set_staging(commit_hash)
         git_commit_with_same_authorship(commit_hash, None)
         git_amend_with_commit_msg(revertsubject, None)
@@ -148,6 +170,7 @@ def htime_write_inner(patchlines: str, oidlen: int) -> TodoEdits:
 
 @subcommand
 def htime_update(rebaseline: str, result: str) -> None:
+    """Apply a TodoEdits JSON document (from "write") to the todo list on stdin."""
     lines = sys.stdin.read().splitlines()
     lineno = lines.index(rebaseline)
     assert result.startswith("{"), repr(result)
@@ -198,23 +221,35 @@ def htime_update(rebaseline: str, result: str) -> None:
     print("\n".join(lines))
 
 
+# Which commit message a squash-style verb uses:
+# "prev" = the previous commit's message (fixup),
+# "cur"  = this commit's message,
+# "both" = both messages concatenated (squash).
 Squash = Literal["prev", "cur", "both"]
 
 
 @dataclass(frozen=True)
 class ParsedVerb:
+    """A parsed git-rebase-todo verb: whether to edit the message, and how to squash."""
+
     edit: bool
     squash: Squash | None
 
     def combine(self, edit: bool, squash: Squash) -> "tuple[ParsedVerb, Squash]":
+        """Merge this line's verb with the following line's verb.
+
+        Returns the combined verb for this line, and which commit's message
+        ("prev"/"cur"/"both") the squashed commit should use.
+        """
         edit = self.edit or edit
         if self.squash is None:
             return ParsedVerb(edit, None), squash
         if squash == "cur":
-            return ParsedVerb(edit, "cur" if squash == "cur" else self.squash), "cur"
+            return ParsedVerb(edit, "cur"), "cur"
         return ParsedVerb(edit, self.squash), squash
 
     def to_verb(self) -> str:
+        """Render back to a git-rebase-todo verb (note the trailing space)."""
         match (self.edit, self.squash):
             case (False, None):
                 return "pick "
@@ -231,6 +266,7 @@ class ParsedVerb:
 
 
 def parse_verb(verb: str) -> ParsedVerb | None:
+    """Parse a pick/reword/squash/fixup verb; None if unrecognized (e.g. "edit")."""
     if verb.startswith("p"):
         return ParsedVerb(False, None)
     if verb.startswith("r"):
@@ -248,12 +284,17 @@ def parse_verb(verb: str) -> ParsedVerb | None:
 
 @dataclass(frozen=True)
 class SequencerLine:
+    """One parsed git-rebase-todo line, formatted as verb + oid + optional number sign + suffix."""
+
     verb: str
     oid: str
-    hash: str
+    # sep: Whitespace and optional number sign between oid and suffix.
+    sep: str
+    # suffix: Commit subject without leading whitespace.
     suffix: str
 
     def update(self, *, verb: str | None = None, oid: str | None = None, suffix: str | None = None) -> "SequencerLine":
+        """Return a copy with the given fields replaced (oid truncated to the existing abbreviation length)."""
         if verb is None:
             verb = self.verb
         else:
@@ -266,16 +307,22 @@ class SequencerLine:
             suffix = self.suffix
         else:
             assert suffix.endswith("\n") == self.suffix.endswith("\n")
-        return SequencerLine(verb, oid, self.hash, suffix)
+        return SequencerLine(verb, oid, self.sep, suffix)
 
     def __str__(self) -> str:
-        return f"{self.verb}{self.oid}{self.hash}{self.suffix}"
+        return f"{self.verb}{self.oid}{self.sep}{self.suffix}"
 
 
 def parse_sequencer_line(
     line: str, like: SequencerLine | None = None
 ) -> SequencerLine | None:
-    """
+    """Parse one git-rebase-todo line.
+
+    Returns None for comments, blank lines, and commands that are safe to
+    move commits past (drop/label/break/update-ref). Returns a line with an
+    empty oid for commands that are not safe to move past (exec/reset/merge).
+    When `like` is given, match its oid abbreviation length and separator.
+
     >>> assert parse_sequencer_line('t asd') is not None
     """
     mo = re.fullmatch(
@@ -285,7 +332,7 @@ def parse_sequencer_line(
     )
     if mo is None:
         return None
-    verb, oid, hash, suffix, otherverb, otherarg = mo.groups()
+    verb, oid, sep, suffix, otherverb, otherarg = mo.groups()
     if otherverb:
         if otherverb in ("d", "drop", "l", "label", "b", "break", "u", "update-ref"):
             # These are safe to move past - pretend they don't match
@@ -295,13 +342,19 @@ def parse_sequencer_line(
     if like:
         oid = oid[: len(like.oid)]
     if like:
-        hash = like.hash
-    return SequencerLine(verb, oid, hash, suffix)
+        sep = like.sep
+    return SequencerLine(verb, oid, sep, suffix)
 
 
 def move_conflict(
     up_or_down: Literal["down", "up"], moveoid: str, lineoid: str, movefiles: list[str]
 ) -> str | None:
+    """Check whether `moveoid` can be moved past `lineoid` without changing history.
+
+    Returns None if the move is safe, otherwise a human-readable reason.
+    Simulates applying the two commits in the other order (via git
+    merge-file on each path they share) and checks the result is identical.
+    """
     numstats = {ns.path for ns in git_show_numstat(lineoid).numstat}
     for path in movefiles:
         # Can moveoid's changes to `path` be moved past this line?
@@ -371,6 +424,10 @@ def move_conflict(
 
 @subcommand
 def htime_move(lineno: int, up_or_down: Literal["down", "up"]) -> None:
+    """Print JSON describing how far the given (1-indexed) line can move.
+
+    {"movelines": n} if it can move, or {"message": reason} if it cannot.
+    """
     lines = sys.stdin.read().splitlines()
     assert 1 <= lineno <= len(lines)
     targetline = parse_sequencer_line(lines[lineno - 1])
@@ -407,109 +464,6 @@ def htime_move(lineno: int, up_or_down: Literal["down", "up"]) -> None:
             print("{}")
     else:
         print(json.dumps({"movelines": mv}))
-
-
-@subcommand
-def htime_cleanup() -> None:
-    """
-    Update a git rebase todo list, remaking commit objects
-    to turn trivial cherry-picks into actual fast-forwards.
-    After swapping two commits early in a long todo list,
-    remaking commit objects can be significantly faster than
-    having git do the full cherry picks.
-    """
-    lines: list[SequencerLine] = []
-    inputlines: list[str | int] = []
-    for line in sys.stdin.read().splitlines(True):
-        parsed = parse_sequencer_line(line)
-        if parsed is None:
-            inputlines.append(line)
-        else:
-            inputlines.append(len(lines))
-            lines.append(parsed)
-    if not lines:
-        # No parse results
-        raise Exception("Nothing to do")
-    head = git_rev_parse(f"{lines[0].oid}^")
-    assert head, lines[0]
-    stat_ff = 0
-    stat_recommit = 0
-    needs_full_cherry_pick = 0
-    for i, parsed in enumerate(lines):
-        parent = git_rev_parse(f"{parsed.oid}^")
-        if same_oid(parent, head):
-            # Fast-forward
-            stat_ff += 1
-            head = parsed.oid
-        elif git_is_same(parent, head):
-            stat_recommit += 1
-            if needs_full_cherry_pick:
-                # No reason to make a new commit object,
-                # as git is anyway going to do a full cherry-pick.
-                head = parsed.oid
-            else:
-                git_set_head_and_staging(head, parsed.oid)
-                git_commit_with_same_authorship(parsed.oid)
-                head = git_rev_parse("@")
-                lines[i] = parsed.update(oid=head)
-        else:
-            if not stat_recommit and not needs_full_cherry_pick:
-                # We haven't done any quick remakes of commit objects.
-                # Try to do the cherry-pick without a worktree.
-                git_set_head_and_staging(head, head)
-                err = git_apply_cached_from_git_show(parsed.oid)
-                if err:
-                    lines[i] = parse_sequencer_line(f"{str(lines[i]).rstrip()} # CONFLICT\n")
-                    needs_full_cherry_pick += 1
-                    head = parsed.oid
-                    continue
-                git_commit_with_same_authorship(parsed.oid)
-                head = git_rev_parse("@")
-                assert head
-                lines[i] = parsed.update(oid=head)
-                lines[i] = parse_sequencer_line(f"{str(lines[i]).rstrip()} # SUCCESS\n")
-            else:
-                needs_full_cherry_pick += 1
-                head = parsed.oid
-                continue
-        # The current line's parent is the previous line.
-        # Should we squash them together?
-        b = parse_verb(parsed.verb)
-        if b is not None and b.squash is not None and i > 0:
-            a = parse_verb(lines[i - 1].verb)
-            if a is not None:
-                c, d = a.combine(b.edit, b.squash)
-                newverb = c.to_verb()
-                newsuf = lines[i - 1].suffix
-                git_set_head_and_staging(f"{lines[i - 1].oid}^", parsed.oid)
-                if d == "prev":
-                    git_commit_with_same_authorship(lines[i - 1].oid)
-                else:
-                    git_commit_with_same_authorship(parsed.oid)
-                    if d == "both":
-                        commitmsg = "\n\n".join(
-                            [
-                                git_show_commit_message(lines[i - 1].oid),
-                                git_show_commit_message(parsed.oid),
-                                ]
-                            )
-                        git_amend_with_commit_msg(commitmsg, None)
-                    else:
-                        newsuf = parsed.suffix
-                lines[i - 1] = SequencerLine("", "", "", "")
-                head = git_rev_parse("@")
-                assert head is not None
-                lines[i] = parsed.update(verb=newverb, oid=head, suffix=newsuf)
-    for x in inputlines:
-        print(x if isinstance(x, str) else lines[x], end="")
-
-
-def same_oid(a: str, b: str) -> bool:
-    assert 4 <= len(a) <= 40
-    assert 4 <= len(b) <= 40
-    assert int(a, 16)
-    assert int(b, 16)
-    return a.startswith(b) if len(a) > len(b) else b.startswith(a)
 
 
 if __name__ == "__main__":
