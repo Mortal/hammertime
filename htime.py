@@ -34,7 +34,7 @@ def htime_open(rebaseline: str) -> None:
     todo = parse_sequencer_line(rebaseline)
     assert todo is not None
     assert todo.oid
-    subprocess.call(("git", "show", "--stat", "-U", todo.oid, "--"))
+    subprocess.call(("git", "show", "--full-index", "--stat", "-U", todo.oid, "--"))
 
 
 @subcommand
