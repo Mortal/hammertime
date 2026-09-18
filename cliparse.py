@@ -35,7 +35,7 @@ def make_cliparser(
         args = parser.parse_args()
         if args.help or args.command == "help" or args.command is None:
             print(help.strip())
-            exit(1)
+            raise SystemExit
         args.subcommand_impl(args)
 
     def subcommand(main_func: Callable[..., None]) -> None:
