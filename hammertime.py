@@ -5,7 +5,6 @@ htime.py to manipulate commits, the index and HEAD. Set the
 DEBUG_GIT_COMMANDS environment variable to echo every git command run.
 """
 
-import argparse
 import os
 import string
 import subprocess
@@ -13,10 +12,6 @@ from dataclasses import dataclass
 
 # Set this env.var to debug what the script is doing in API or git terms:
 DEBUG_GIT_COMMANDS = bool(os.environ.get("DEBUG_GIT_COMMANDS"))
-
-parser = argparse.ArgumentParser()
-parser.add_argument("base")
-parser.add_argument("tip")
 
 
 def public[T](f: T) -> T:
@@ -130,10 +125,13 @@ def git_merge_file(*, current: str, base: str, other: str) -> tuple[str, int]:
             base = zero_object
         if git_rev_parse(other) is None:
             other = zero_object
+        # Unlike the first run above, errors from the git merge-file below
+        # are fatal, so let it inherit our stderr and print any errors.
         p = subprocess.run(
             ("git", "merge-file", "--object-id", current, base, other),
             universal_newlines=True,
             stdout=subprocess.PIPE,
+            stderr=None,
         )
     if not 0 <= p.returncode <= 127:
         p.check_returncode()

@@ -9,7 +9,7 @@ function HtimeEdit()
 	let l:rebaseline = getline('.')
 	let l:rebasebuf = bufnr()
 	let l:rebasewin = winnr()
-	if l:rebaseline =~ '^[presf]'
+	if l:rebaseline =~ '^[presf]\>\|^pick\|^reword\|^edit\|^squash\|^fixup'
 		new
 		let b:rebaseline = l:rebaseline
 		let b:rebasebuf = l:rebasebuf
@@ -25,8 +25,6 @@ endfunction
 " On :w in the scratch buffer: feed the edited patch to "htime write",
 " then update the todo list buffer with the result of "htime update".
 function HtimeEditWrite()
-	let l:commitbuf = bufnr()
-	let l:commitwin = winnr()
 	let l:rebaseline = b:rebaseline
 	let l:rebasebuf = b:rebasebuf
 	let l:rebasewin = b:rebasewin
@@ -36,6 +34,9 @@ function HtimeEditWrite()
 		set nomodified
 		exec 'silent buffer! '.l:rebasebuf
 		exec 'silent %!python3 '.s:path.'/htime.py update --rebaseline '.shellescape(l:rebaseline, 1).' --result '.shellescape(l:result, 1).' || :'
+		" Unfortunately we cannot force-close the window after writing,
+		" so in case the user uses ":w" instead of ":wq", we use :enew
+		" here to leave a new empty buffer behind.
 		enew
 	endif
 endfunction

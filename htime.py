@@ -45,7 +45,10 @@ def htime_open(rebaseline: str) -> None:
     todo = parse_sequencer_line(rebaseline)
     assert todo is not None
     assert todo.oid
-    subprocess.call(("git", "show", "--full-index", "--stat", "-U", todo.oid, "--"))
+    # The output of this script is shown in a fresh editor buffer,
+    # so it is OK to ignore the exit code of git show here,
+    # as git show will write a useful error on stderr if it fails.
+    subprocess.call(("git", "show", "--full-index", "--stat", "-U3", todo.oid, "--"))
 
 
 @subcommand
@@ -81,12 +84,15 @@ class TodoEdits(TypedDict):
 def parse_git_patch(thepatch: str) -> tuple[str, str]:
     """Extract (commit hash, commit message) from hand-edited "git show" output."""
     if "\r" in thepatch:
+        # Every \r must be part of a \r\n line ending; strip to plain LF.
         assert thepatch.count("\r\n") == thepatch.count("\r")
         thepatch = thepatch.replace("\r", "")
     mo = re.match(r"^commit\s+([0-9a-fA-F]+)", thepatch)
     if mo is None:
         raise Exception("input does not look like a git patch")
     commit_hash = mo.group(1)
+    # Peel off, in order: the commit/author/date header block, the diff body,
+    # and the "---" separator, leaving just the commit message.
     headers, sep, mainmatter = thepatch.partition("\n\n")
     commit_message, sep, rest = mainmatter.partition("\ndiff --git ")
     commit_message, sep, rest = commit_message.partition("\n---\n")
@@ -124,7 +130,7 @@ def htime_write_inner(patchlines: str, oidlen: int) -> TodoEdits:
             print("No changes")
             return {}
         if commit_msg_change:
-            subject = commit_msg.splitlines()[0]
+            subject = patchsubject
         else:
             subject = (
                 f'Changes to "{patchsubject}"'
@@ -136,35 +142,39 @@ def htime_write_inner(patchlines: str, oidlen: int) -> TodoEdits:
             if patchsubject
             else f"Revert changes to {commit_hash[:oidlen]}"
         )
-        # Edits applied to index, and HEAD is at head_sha.
         if not edited_files:
             # Amend existing commit with the updated commit message.
             git_set_head(f"{commit_hash}^")
-            git_commit_with_same_authorship(commit_hash, None)
-            git_amend_with_commit_msg(commit_msg, None)
+            git_commit_with_same_authorship(commit_hash)
+            git_amend_with_commit_msg(commit_msg)
             newhead = git_rev_parse("HEAD")
             assert newhead
             subject = commit_msg.splitlines()[0]
             res: TodoEdits = {"replace": f"pick {newhead} {subject}".rstrip()}
             print("No hand-edited files, just a commit message update")
             return res
-        git_commit_with_same_authorship(commit_hash, None)
+        # Edits applied to index, and HEAD is at commit_hash.
+        # Create fixup commit with the user's edits to the patch.
+        git_commit_with_same_authorship(commit_hash)
         if commit_msg_change:
-            git_amend_with_commit_msg(commit_msg, None)
+            git_amend_with_commit_msg(commit_msg)
         hammer1 = git_rev_parse("HEAD")
         assert hammer1
         if commit_msg_change:
             res = {"justbelow": f"f -C {hammer1} {subject}".rstrip()}
         else:
             res = {"justbelow": f"f {hammer1} {subject}".rstrip()}
+        # Second hammer commit: reset the index to the original commit's tree
+        # and commit it on top of hammer1, so this commit reverts the hand-edits.
         git_set_staging(commit_hash)
-        git_commit_with_same_authorship(commit_hash, None)
-        git_amend_with_commit_msg(revertsubject, None)
+        git_commit_with_same_authorship(commit_hash)
+        git_amend_with_commit_msg(revertsubject)
         hammer2 = git_rev_parse("HEAD")
         assert hammer2
         res["movedown"] = f"pick {hammer2} {revertsubject}".rstrip()
         return res
     finally:
+        # Restore the HEAD/index we started from, whatever happened above.
         git_set_head_and_staging(head_sha, None)
 
 
@@ -172,7 +182,12 @@ def htime_write_inner(patchlines: str, oidlen: int) -> TodoEdits:
 def htime_update(rebaseline: str, result: str) -> None:
     """Apply a TodoEdits JSON document (from "write") to the todo list on stdin."""
     lines = sys.stdin.read().splitlines()
-    lineno = lines.index(rebaseline)
+    try:
+        lineno = lines.index(rebaseline)
+    except ValueError:
+        raise SystemExit("The given --rebaseline was not found in the input")
+    if rebaseline in lines[lineno + 1 :]:
+        raise SystemExit("The given --rebaseline occurs several times in the input")
     assert result.startswith("{"), repr(result)
     edits: TodoEdits = json.loads(result)
     assert isinstance(edits, dict)
@@ -197,89 +212,37 @@ def htime_update(rebaseline: str, result: str) -> None:
         assert moveline.oid
         targetnumstat = git_show_numstat(moveline.oid)
         movefiles = sorted(ns.path for ns in targetnumstat.numstat)
+        # See how far down we can insert edits["movedown"] without causing conflicts.
+        # If we can move it all the way down, insert it commented-out
+        # (as it's a revert commit that the user likely doesn't care about).
         while True:
+            # Try to see if we can move past the next 'pick' line.
+            # First, skip over comments/blanks in the todo list.
             line = parse_sequencer_line(lines[ins]) if ins < len(lines) else None
             skip = 0
             while line is None and ins + skip + 1 < len(lines):
                 skip += 1
                 line = parse_sequencer_line(lines[ins + skip])
             if line is None:
-                # Doesn't need to be applied
+                # We made it to the end, so we insert it commented-out.
                 lines[ins:ins] = [f"# {moveline}"]
                 break
+            # Skip the identified comments/blanks in the todo list.
             ins += skip
             if not line.oid:
-                # Emit the 'pick' line here
+                # Dangerous/foreign line that we cannot check conflicts with.
+                # Just emit the 'pick' line here.
                 lines[ins:ins] = [f"{moveline}"]
                 break
+            # Check for conflicts with this next todo line.
             conflictfile = move_conflict("down", moveline.oid, line.oid, movefiles)
             if conflictfile is not None:
-                # Emit the 'pick' line here
+                # There was a conflict, so we cannot move past this line.
                 lines[ins:ins] = [f"{moveline} # {conflictfile}"]
                 break
+            # No conflict -> move past this line and keep going.
             ins += 1
     print("\n".join(lines))
-
-
-# Which commit message a squash-style verb uses:
-# "prev" = the previous commit's message (fixup),
-# "cur"  = this commit's message,
-# "both" = both messages concatenated (squash).
-Squash = Literal["prev", "cur", "both"]
-
-
-@dataclass(frozen=True)
-class ParsedVerb:
-    """A parsed git-rebase-todo verb: whether to edit the message, and how to squash."""
-
-    edit: bool
-    squash: Squash | None
-
-    def combine(self, edit: bool, squash: Squash) -> "tuple[ParsedVerb, Squash]":
-        """Merge this line's verb with the following line's verb.
-
-        Returns the combined verb for this line, and which commit's message
-        ("prev"/"cur"/"both") the squashed commit should use.
-        """
-        edit = self.edit or edit
-        if self.squash is None:
-            return ParsedVerb(edit, None), squash
-        if squash == "cur":
-            return ParsedVerb(edit, "cur"), "cur"
-        return ParsedVerb(edit, self.squash), squash
-
-    def to_verb(self) -> str:
-        """Render back to a git-rebase-todo verb (note the trailing space)."""
-        match (self.edit, self.squash):
-            case (False, None):
-                return "pick "
-            case (True, None):
-                return "r "
-            case (True, "cur"):
-                return "f -c "
-            case (False, "cur"):
-                return "f -C "
-            case (False, "prev"):
-                return "f "
-            case _:
-                return "s "
-
-
-def parse_verb(verb: str) -> ParsedVerb | None:
-    """Parse a pick/reword/squash/fixup verb; None if unrecognized (e.g. "edit")."""
-    if verb.startswith("p"):
-        return ParsedVerb(False, None)
-    if verb.startswith("r"):
-        return ParsedVerb(True, None)
-    if verb.startswith("s"):
-        return ParsedVerb(True, "both")
-    if verb.startswith("f"):
-        if "-c" in verb:
-            return ParsedVerb(True, "cur")
-        if "-C" in verb:
-            return ParsedVerb(False, "cur")
-        return ParsedVerb(False, "prev")
-    return None
 
 
 @dataclass(frozen=True)
@@ -293,12 +256,28 @@ class SequencerLine:
     # suffix: Commit subject without leading whitespace.
     suffix: str
 
-    def update(self, *, verb: str | None = None, oid: str | None = None, suffix: str | None = None) -> "SequencerLine":
+    def update(
+        self,
+        *,
+        verb: str | None = None,
+        oid: str | None = None,
+        suffix: str | None = None,
+    ) -> "SequencerLine":
         """Return a copy with the given fields replaced (oid truncated to the existing abbreviation length)."""
         if verb is None:
             verb = self.verb
         else:
             assert verb.endswith(" ")
+            if len(self.verb.rstrip()) == 1:
+                # self.verb is abbreviated, so also abbreviate the new verb
+                verb = {
+                    "exec": "x",
+                    "pick": "p",
+                    "reword": "r",
+                    "squash": "s",
+                    "fixup": "f",
+                    "edit": "e",
+                }[verb.rstrip()] + " "
         if oid is None:
             oid = self.oid
         else:
@@ -324,9 +303,13 @@ def parse_sequencer_line(
     When `like` is given, match its oid abbreviation length and separator.
 
     >>> assert parse_sequencer_line('t asd') is not None
+    >>> assert parse_sequencer_line('pick 1234567') is not None
     """
+    # Two alternatives: (1) an oid-bearing command (pick/reword/edit/squash/
+    # fixup, long or abbreviated, optional -C flag) captured as
+    # verb/oid/sep/suffix; (2) any other command verb with its raw argument.
     mo = re.fullmatch(
-        r"^(?:(\s*(?:p|pick|r|reword|e|edit|s|squash|f|fixup)\s*(?:-[Cc]\s*)?)([0-9a-f]+)(\s+#?\s*)((?:.*)?)|(\s*[a-z][a-z-]*)(.*))\Z",
+        r"^(?:(\s*(?:p|pick|r|reword|e|edit|s|squash|f|fixup)\s*(?:-[Cc]\s*)?)([0-9a-f]+)(\Z|\s+#?\s*)((?:.*)?)|(\s*[a-z][a-z-]*)(.*))\Z",
         line,
         re.S,
     )
@@ -334,14 +317,22 @@ def parse_sequencer_line(
         return None
     verb, oid, sep, suffix, otherverb, otherarg = mo.groups()
     if otherverb:
-        if otherverb in ("d", "drop", "l", "label", "b", "break", "u", "update-ref"):
+        if otherverb.strip() in (
+            "d",
+            "drop",
+            "l",
+            "label",
+            "b",
+            "break",
+            "u",
+            "update-ref",
+        ):
             # These are safe to move past - pretend they don't match
             return None
         # exec, reset, merge -> these are dangerous
         return SequencerLine(otherverb, "", "", otherarg)
     if like:
         oid = oid[: len(like.oid)]
-    if like:
         sep = like.sep
     return SequencerLine(verb, oid, sep, suffix)
 
@@ -355,14 +346,20 @@ def move_conflict(
     Simulates applying the two commits in the other order (via git
     merge-file on each path they share) and checks the result is identical.
     """
-    numstats = {ns.path for ns in git_show_numstat(lineoid).numstat}
+    # Paths touched by the line being moved past.
+    touched_paths = {ns.path for ns in git_show_numstat(lineoid).numstat}
+    # Paths involved in a merge conflict, making us unable to move the commit.
+    conflict_paths: list[str] = []
+    if up_or_down == "up":
+        error_prefix = f"Cannot move {moveoid} up above {lineoid}"
+    else:
+        error_prefix = f"Cannot move {moveoid} down below {lineoid}"
     for path in movefiles:
         # Can moveoid's changes to `path` be moved past this line?
-        if path not in numstats:
+        if path not in touched_paths:
             # Trivially yes, since this line doesn't modify `path`
             continue
         if up_or_down == "up":
-            errmsg = f"Cannot move {moveoid} up above {lineoid}"
             # Move B up above A: Try to apply B to A^.
             oid, conflicts = git_merge_file(
                 current=f"{lineoid}^:{path}",
@@ -370,7 +367,8 @@ def move_conflict(
                 other=f"{moveoid}:{path}",
             )
             if conflicts:
-                return f"{errmsg}: Merge conflict on {path}"
+                conflict_paths.append(path)
+                continue
             # Then apply A and check that we obtain AB.
             oid, conflicts = git_merge_file(
                 current=oid,
@@ -391,7 +389,6 @@ def move_conflict(
                 # but the result differs depending on the order.
                 return f"{errmsg}: Commits are non-commutative on {path}"
         else:
-            errmsg = f"Cannot move {moveoid} down below {lineoid}"
             # Move A down below B: Try to revert A on B.
             oid, conflicts = git_merge_file(
                 current=f"{lineoid}:{path}",
@@ -399,7 +396,8 @@ def move_conflict(
                 other=f"{moveoid}^:{path}",
             )
             if conflicts:
-                return f"{errmsg}: Merge conflict on {path}"
+                conflict_paths.append(path)
+                continue
             # Then revert B and check that we obtain the base file.
             oid, conflicts = git_merge_file(
                 current=oid,
@@ -419,6 +417,8 @@ def move_conflict(
                 # This means the patches can be applied in either order,
                 # but the result differs depending on the order.
                 return f"{errmsg}: Commits are non-commutative on {path}"
+    if conflict_paths:
+        return f"{errmsg}: Merge conflict on {', '.join(conflict_paths)}"
     return None
 
 
@@ -438,6 +438,8 @@ def htime_move(lineno: int, up_or_down: Literal["down", "up"]) -> None:
     movefiles = [ns.path for ns in git_show_numstat(moveoid).numstat]
     dd = 1 if up_or_down == "down" else -1
     ix = lineno - 1 + dd
+    # extra: unparseable lines passed since the last parseable line (they
+    # must be jumped over together); mv: total line distance travelled.
     extra = 0
     mv = 0
     conflictmessage: str | None = None
@@ -454,12 +456,13 @@ def htime_move(lineno: int, up_or_down: Literal["down", "up"]) -> None:
         conflictmessage = move_conflict(up_or_down, moveoid, line.oid, movefiles)
         if conflictmessage is not None:
             break
+        # This line and any unparseable lines before it all count toward the distance.
         mv += extra + 1
         extra = 0
         ix += dd
     if mv == 0:
         if conflictmessage:
-            print(json.dumps({"message": conflictmessage}))
+            print(json.dumps({"message": str(conflictmessage)}))
         else:
             print("{}")
     else:

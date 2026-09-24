@@ -125,6 +125,8 @@ def make_cliparser(
             if typing.get_origin(the_type) is Literal:
                 choices = typing.get_args(the_type)
                 the_type = type(choices[0])
+                if not all(type(c) is the_type for c in choices):
+                    raise Exception("For Literal, all values must be the same type")
 
             if parameter.kind == Parameter.VAR_POSITIONAL:
                 assert the_type is not bool
