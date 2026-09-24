@@ -43,6 +43,8 @@ endfunction
 
 " Key bindings in gitrebase buffers:
 " <Leader>j/k move the line down/up, Enter edits the commit's diff.
-au FileType gitrebase nnoremap <silent> <buffer> <Leader>j :py3 htime_move("down")<CR>
-au FileType gitrebase nnoremap <silent> <buffer> <Leader>k :py3 htime_move("up")<CR>
+au FileType gitrebase nnoremap <silent> <buffer> <Leader>j :py3 htime_cmd("move", "down")<CR>
+au FileType gitrebase nnoremap <silent> <buffer> <Leader>k :py3 htime_cmd("move", "up")<CR>
+au FileType gitrebase nnoremap <silent> <buffer> <Leader>J :py3 htime_cmd("swap", "down")<CR>
+au FileType gitrebase nnoremap <silent> <buffer> <Leader>K :py3 htime_cmd("swap", "up")<CR>
 au FileType gitrebase nnoremap <silent> <buffer> <CR> :call HtimeEdit()<CR>

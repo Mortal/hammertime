@@ -76,6 +76,13 @@ def git_log_numstat(refspec: str) -> list[CommitNumstat]:
 
 
 @public
+def git_rev_parse_head() -> str:
+    res = git_rev_parse("HEAD")
+    assert res is not None
+    return res
+
+
+@public
 def git_rev_parse(refspec: str) -> str | None:
     cmdline = ["git", "rev-parse", "--quiet", "--verify", "--end-of-options", refspec]
     if DEBUG_GIT_COMMANDS:
@@ -217,16 +224,27 @@ def git_set_head(head: str) -> None:
 
 
 @public
-def git_set_staging(staging: str, cwd: str | None = None) -> None:
-    cmdline = ["git", "reset", "-q", staging, "--", "."]
+def git_set_staging(
+    staging: str,
+    cwd: str | None = None,
+    *,
+    file_list: list[str] | tuple[str, ...] | None = None,
+) -> None:
+    "Note, must be called from the toplevel of the repository."
+    cmdline = ["git", "reset", "-q", staging, "--", *(file_list or ["."])]
     if DEBUG_GIT_COMMANDS:
         print(*cmdline, flush=True)
     subprocess.check_call(cmdline, cwd=cwd)
 
 
 @public
-def git_apply_cached_from_git_show(refspec: str, cwd: str | None = None) -> int:
-    cmdline1 = ["git", "show", "--end-of-options", refspec]
+def git_apply_cached_from_git_show(
+    refspec: str,
+    cwd: str | None = None,
+    *,
+    file_list: list[str] | tuple[str, ...] | None = None,
+) -> int:
+    cmdline1 = ["git", "show", "--end-of-options", refspec, "--", *(file_list or [])]
     if DEBUG_GIT_COMMANDS:
         print(*cmdline1, flush=True)
     with subprocess.Popen(cmdline1, stdout=subprocess.PIPE, cwd=cwd) as p:
@@ -239,6 +257,21 @@ def git_apply_cached_from_git_show(refspec: str, cwd: str | None = None) -> int:
 
 
 @public
+def git_apply_cached_unidiff_zero_from_str(
+    patch: str,
+    cwd: str | None = None,
+) -> None:
+    cmdline = ["git", "apply", "--unidiff-zero", "--allow-empty", "--cached", "-"]
+    if DEBUG_GIT_COMMANDS:
+        print(*cmdline, flush=True)
+    try:
+        subprocess.run(cmdline, input=patch, check=True, cwd=cwd, text=True)
+    except subprocess.CalledProcessError:
+        print(patch)
+        raise
+
+
+@public
 def git_apply_cached_recount(patch: str, cwd: str | None = None) -> None:
     cmdline = ["git", "apply", "--allow-empty", "--cached", "--recount", "-"]
     if DEBUG_GIT_COMMANDS:
@@ -248,7 +281,7 @@ def git_apply_cached_recount(patch: str, cwd: str | None = None) -> None:
 
 @public
 def git_commit_with_same_authorship(
-    commit_hash: str, file_list: list[str] | None = None
+    commit_hash: str, file_list: list[str] | tuple[str, ...] | None = None
 ) -> None:
     cmdline = [
         "git",
@@ -268,7 +301,7 @@ def git_commit_with_same_authorship(
 
 
 @public
-def git_amend(file_list: list[str] | None) -> None:
+def git_amend(file_list: list[str] | tuple[str, ...] | None) -> None:
     cmdline = [
         "git",
         "commit",
@@ -285,7 +318,7 @@ def git_amend(file_list: list[str] | None) -> None:
 
 
 @public
-def git_amend_with_commit_msg(commit_msg: str, file_list: list[str] | None) -> None:
+def git_amend_with_commit_msg(commit_msg: str, file_list: list[str] | None = None) -> None:
     cmdline = [
         "git",
         "commit",
@@ -314,6 +347,30 @@ def git_commit_tree(tree: str, message: str, parents: list[str]) -> str:
     return subprocess.run(
         cmdline, input=message, text=True, stdout=subprocess.PIPE
     ).stdout.strip()
+
+
+@public
+def git_reset_patch_first_hunk(
+    refspec: str, file_list: list[str] | tuple[str, ...] | None = None
+) -> None:
+    """Stage the first hunk of refspec's changes by driving interactive
+    "git reset -p" with the canned answers split/yes/quit."""
+    cmdline = ["git", "reset", "-p", refspec, "--", *(file_list or ())]
+    stdin = "s\ny\nq\n"
+    if DEBUG_GIT_COMMANDS:
+        print(f"printf '%s' {repr(stdin)} |", *cmdline, flush=True)
+    subprocess.run(
+        cmdline, input=stdin, text=True, stdout=subprocess.DEVNULL, check=True
+    )
+
+
+@public
+def git_show_commit_subject(refspec: str) -> str:
+    cmdline = ["git", "show", "-s", "--pretty=%s", refspec]
+    if DEBUG_GIT_COMMANDS:
+        print("$", *cmdline, flush=True)
+    output = subprocess.check_output(cmdline, text=True).strip()
+    return output.strip()
 
 
 @public

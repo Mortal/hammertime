@@ -11,25 +11,29 @@ import subprocess
 import sys
 import textwrap
 from dataclasses import dataclass
-from typing import Literal, NotRequired, TypedDict
+from typing import Iterator, Literal, NotRequired, TypedDict
 
 from cliparse import make_cliparser
 from hammertime import (
     git_amend_with_commit_msg,
     git_any_staged_changes,
     git_apply_cached_from_git_show,
+    git_apply_cached_unidiff_zero_from_str,
     git_apply_cached_recount,
     git_commit_with_same_authorship,
     git_files_with_staged_changes,
     git_is_same,
     git_merge_file,
     git_rev_parse,
+    git_rev_parse_head,
     git_rev_parse_show_toplevel,
     git_set_head,
     git_set_head_and_staging,
     git_set_staging,
     git_show_commit_message,
+    git_show_commit_subject,
     git_show_numstat,
+    git_write_tree,
 )
 
 
@@ -337,9 +341,25 @@ def parse_sequencer_line(
     return SequencerLine(verb, oid, sep, suffix)
 
 
+@dataclass(frozen=True)
+class MoveConflict:
+    """Why a commit cannot (yet) be moved past another todo line."""
+
+    error_prefix: str
+    error: str
+    paths: tuple[str, ...]
+
+    def __str__(self) -> str:
+        return f"{self.error_prefix}: {self.error} on {', '.join(self.paths)}"
+
+
+# Special value for MoveConflict.error, matched inside htime_swap().
+MERGE_CONFLICT_ERROR = "Merge conflict"
+
+
 def move_conflict(
     up_or_down: Literal["down", "up"], moveoid: str, lineoid: str, movefiles: list[str]
-) -> str | None:
+) -> MoveConflict | None:
     """Check whether `moveoid` can be moved past `lineoid` without changing history.
 
     Returns None if the move is safe, otherwise a human-readable reason.
@@ -376,18 +396,22 @@ def move_conflict(
                 other=f"{lineoid}:{path}",
             )
             if conflicts:
-                return f"{errmsg}: Commits cancel out on {path}"
+                return MoveConflict(error_prefix, "Commits cancel out", (path,))
             expected, expectedconflicts = git_merge_file(
                 current=f"{lineoid}:{path}",
                 base=f"{moveoid}^:{path}",
                 other=f"{moveoid}:{path}",
             )
             if expectedconflicts:
-                raise Exception(f"{errmsg}: Initial state has a conflict on {path}")
+                return MoveConflict(
+                    error_prefix, "Initial state has a conflict", (path,)
+                )
             if expected != oid:
                 # This means the patches can be applied in either order,
                 # but the result differs depending on the order.
-                return f"{errmsg}: Commits are non-commutative on {path}"
+                return MoveConflict(
+                    error_prefix, "Commits are non-commutative", (path,)
+                )
         else:
             # Move A down below B: Try to revert A on B.
             oid, conflicts = git_merge_file(
@@ -405,20 +429,24 @@ def move_conflict(
                 other=f"{lineoid}^:{path}",
             )
             if conflicts:
-                return f"{errmsg}: Commits cancel out on {path}"
+                return MoveConflict(error_prefix, "Commits cancel out", (path,))
             expected, expectedconflicts = git_merge_file(
                 current=f"{lineoid}^:{path}",
                 base=f"{moveoid}:{path}",
                 other=f"{moveoid}^:{path}",
             )
             if expectedconflicts:
-                raise Exception(f"{errmsg}: Initial state has a conflict on {path}")
+                return MoveConflict(
+                    error_prefix, "Initial state has a conflict", (path,)
+                )
             if expected != oid:
                 # This means the patches can be applied in either order,
                 # but the result differs depending on the order.
-                return f"{errmsg}: Commits are non-commutative on {path}"
+                return MoveConflict(
+                    error_prefix, "Commits are non-commutative", (path,)
+                )
     if conflict_paths:
-        return f"{errmsg}: Merge conflict on {', '.join(conflict_paths)}"
+        return MoveConflict(error_prefix, MERGE_CONFLICT_ERROR, tuple(conflict_paths))
     return None
 
 
@@ -442,7 +470,7 @@ def htime_move(lineno: int, up_or_down: Literal["down", "up"]) -> None:
     # must be jumped over together); mv: total line distance travelled.
     extra = 0
     mv = 0
-    conflictmessage: str | None = None
+    conflictmessage: MoveConflict | str | None = None
     while 0 <= ix < len(lines):
         line = parse_sequencer_line(lines[ix])
         if line is None:
@@ -467,6 +495,514 @@ def htime_move(lineno: int, up_or_down: Literal["down", "up"]) -> None:
             print("{}")
     else:
         print(json.dumps({"movelines": mv}))
+
+
+@dataclass(frozen=True)
+class DiffLine:
+    """One line of a unified diff plus its 0-based old/new line numbers.
+
+    For '+' lines, fromline is the gap position in the old file where the
+    line is inserted; for '-' lines, toline is the gap position in the new
+    file where the removed line would have been.
+    """
+
+    diffline: str
+    fromline: int
+    toline: int
+
+
+def diff_parser(lines: Iterator[str]) -> Iterator[DiffLine]:
+    """Yield a DiffLine for every hunk-body line of a single-file unified diff.
+
+    The input must start with the five header lines ("diff --git", "index",
+    "--- a/", "+++ b/", "@@ ") followed by exactly one file's hunks.
+    """
+    it = iter(lines)
+    # TODO: At the moment we don't support mode changes, renames,
+    # similarity-index, or binary-diff lines.
+    diffline: str | None = next(it, None)
+    assert diffline is not None and diffline.startswith("diff --git ")
+    diffline = next(it, None)
+    assert diffline is not None and diffline.startswith("index ")
+    diffline = next(it, None)
+    assert diffline is not None and diffline.startswith("--- a/")
+    diffline = next(it, None)
+    assert diffline is not None and diffline.startswith("+++ b/")
+    diffline = next(it, None)
+    assert diffline is not None and diffline.startswith("@@ ")
+    while diffline is not None:
+        mo = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*", diffline)
+        if mo is None:
+            raise Exception(diffline)
+        fromline_str, fromcount_str, toline_str, tocount_str = mo.groups()
+        fromline = int(fromline_str)
+        # Adjust from 1-based line numbering to 0-based line numbering
+        fromline -= 1
+        fromcount = int(fromcount_str or "1")
+        if fromcount == 0:
+            # Zero-length ranges point correctly in between lines
+            fromline += 1
+        toline = int(toline_str)
+        # Adjust from 1-based line numbering to 0-based line numbering
+        toline -= 1
+        tocount = int(tocount_str or "1")
+        if tocount == 0:
+            # Zero-length ranges point correctly in between lines
+            toline += 1
+        fromseen = 0
+        toseen = 0
+        diffline = next(it, None)
+        while fromseen < fromcount or toseen < tocount:
+            assert diffline is not None
+            yield DiffLine(diffline, fromline + fromseen, toline + toseen)
+            if diffline.startswith("+"):
+                toseen += 1
+            elif diffline.startswith("-"):
+                fromseen += 1
+            elif diffline.startswith(" "):
+                fromseen += 1
+                toseen += 1
+            else:
+                raise Exception(diffline)
+            diffline = next(it, None)
+
+
+@dataclass(frozen=True, kw_only=True)
+class Edit:
+    # old[i1:i2] corresponds to new[j1:j2]
+    i1: int
+    i2: int
+    j1: int
+    j2: int
+    fromlines: tuple[str, ...] | None = None
+    tolines: tuple[str, ...] | None = None
+
+    @property
+    def eof(self) -> bool:
+        """True for the zero-length end-of-diff sentinel Edit."""
+        if self.i1 == self.i2 and self.j1 == self.j2:
+            assert self.fromlines is None
+            assert self.tolines is None
+            return True
+        return False
+
+    @property
+    def equal(self) -> bool:
+        """True for an unchanged (context) range; no +/- lines attached."""
+        if self.fromlines is None:
+            assert self.tolines is None
+            return True
+        assert self.tolines is not None
+        return False
+
+    def offset(self, offi: int, offj: int) -> "Edit":
+        """Return a copy with the old/new ranges shifted by the given amounts."""
+        result = Edit(
+            i1=self.i1 + offi,
+            i2=self.i2 + offi,
+            j1=self.j1 + offj,
+            j2=self.j2 + offj,
+            fromlines=self.fromlines,
+            tolines=self.tolines,
+        )
+        return result
+
+    def net_added(self) -> int:
+        """Line-count shift this edit introduces (positive = new side is longer)."""
+        return self.j2 - self.j1 - (self.i2 - self.i1)
+
+    def range_str(self) -> str:
+        i1 = self.i1
+        i2 = self.i2
+        j1 = self.j1
+        j2 = self.j2
+        # Convert back to 1-based line numbering
+        i1 += 1
+        i2 += 1
+        j1 += 1
+        j2 += 1
+        if self.eof:
+            return f"-{i1},EOF +{j1},EOF"
+        # Convert back to weird zero-length range convention
+        if i1 == i2:
+            i1 -= 1
+            i2 -= 1
+        if j1 == j2:
+            j1 -= 1
+            j2 -= 1
+        if self.equal:
+            return f"-{i1},{i2 - i1}==+{j1},{j2 - j1}"
+        return f"-{i1},{i2 - i1} +{j1},{j2 - j1}"
+
+    def patchlines(self) -> str:
+        if self.fromlines is None or self.tolines is None:
+            return ""
+        fromlines = "".join(f"-{line}" for line in self.fromlines)
+        tolines = "".join(f"+{line}" for line in self.tolines)
+        return f"@@ {self.range_str()} @@\n{fromlines}{tolines}"
+
+
+def opcodes_from_difflines(difflines: Iterator[DiffLine]) -> Iterator[Edit]:
+    """Group a DiffLine stream into difflib-opcodes-style Edit records.
+
+    Yields one Edit per contiguous equal/change run, ending with a
+    zero-length "eof" Edit marking the end position.
+    """
+    it = iter(difflines)
+    diffline: DiffLine | None = next(it, None)
+    if diffline is None:
+        raise Exception("opcodes_from_difflines got an empty input")
+    first = True
+    while diffline is not None:
+        if diffline.diffline.startswith(" "):
+            if first:
+                i1 = j1 = 0
+            else:
+                i1 = diffline.fromline
+                j1 = diffline.toline
+            first = False
+            i2 = diffline.fromline + 1
+            j2 = diffline.toline + 1
+            diffline = next(it, None)
+            while diffline is not None and diffline.diffline.startswith(" "):
+                i2 = diffline.fromline + 1
+                j2 = diffline.toline + 1
+                diffline = next(it, None)
+            yield Edit(i1=i1, j1=j1, i2=i2, j2=j2)
+        else:
+            if first:
+                assert diffline.fromline == diffline.toline, diffline
+                if diffline.fromline >= 1:
+                    yield Edit(
+                        i1=0,
+                        j1=0,
+                        i2=diffline.fromline,
+                        j2=diffline.toline,
+                    )
+            first = False
+            i1 = diffline.fromline
+            j1 = diffline.toline
+            fromlines: list[str] = []
+            tolines: list[str] = []
+            while diffline is not None and not diffline.diffline.startswith(" "):
+                assert diffline.fromline == i1 + len(fromlines), (
+                    diffline,
+                    i1,
+                    len(fromlines),
+                )
+                assert diffline.toline == j1 + len(tolines)
+                if diffline.diffline.startswith("-"):
+                    fromlines.append(diffline.diffline[1:])
+                else:
+                    assert diffline.diffline.startswith("+")
+                    tolines.append(diffline.diffline[1:])
+                diffline = next(it, None)
+            i2 = i1 + len(fromlines)
+            j2 = j1 + len(tolines)
+            yield Edit(
+                i1=i1,
+                j1=j1,
+                i2=i2,
+                j2=j2,
+                fromlines=tuple(fromlines),
+                tolines=tuple(tolines),
+            )
+    # Yield special "eof" Edit (two empty ranges old[i2:i2] to new[j2:j2])
+    yield Edit(i1=i2, j1=j2, i2=i2, j2=j2)
+
+
+def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
+    it_a = opcodes_from_difflines(diff_parser(diff_a))
+    it_b = opcodes_from_difflines(diff_parser(diff_b))
+    edit_a = next(it_a)
+    edit_b = next(it_b)
+    # We create 4 output patches that should be applied in order.
+    out1: list[Edit] = []  # Edits from B that do not conflict with A
+    out2: list[Edit] = []  # Edits from A that have a conflict with B
+    out3: list[Edit] = []  # Edits from B that have a conflict with A
+    out4: list[Edit] = []  # Edits from A that do not conflict with B
+    # The edits are originally applied in the order of first A, then B.
+    # When we split edits into the four patches, we need to apply an offset
+    # to the line numbers in the hunk headers to take into account that
+    # the hunks are now applied in a different order than before.
+    out1offi = 0
+    out1offj = 0
+    out2offi = 0
+    out2offj = 0
+    out3offi = 0
+    out3offj = 0
+    out4offi = 0
+    out4offj = 0
+    while not edit_a.eof or not edit_b.eof:
+        # Check if edit_a's "new range" (j1..j2) fits into edit_b's "old range" (i1..i2)
+        if (
+            not edit_a.eof
+            and not edit_a.equal
+            and (
+                edit_b.eof
+                or (edit_b.equal and edit_b.i1 <= edit_a.j1 and edit_a.j2 <= edit_b.i2)
+            )
+        ):
+            # Put edit_a in the 4th list (moved down below).
+            out4.append(edit_a.offset(out4offi, out4offj))
+            # Stuff that goes in out1,out2,out3 needs to
+            # take into account that this patch is NO LONGER applied,
+            # so their offsets are DECREASED by this hunk's length.
+            out1offi -= edit_a.net_added()
+            out1offj -= edit_a.net_added()
+            out3offi -= edit_a.net_added()
+            out3offj -= edit_a.net_added()
+            out2offj -= edit_a.net_added()
+            edit_a = next(it_a)
+        # Check if edit_b's "old range" (i1..i2) fits into edit_a's "new range" (j1..j2)
+        elif (
+            not edit_b.eof
+            and not edit_b.equal
+            and (
+                edit_a.eof
+                or (edit_a.equal and edit_a.j1 <= edit_b.i1 and edit_b.i2 <= edit_a.j2)
+            )
+        ):
+            # Put edit_b in the 1st list (moved up above).
+            out1.append(edit_b.offset(out1offi, out1offj))
+            # Stuff that goes in out2,out4 needs to
+            # take into account that this patch is now applied BEFORE,
+            # so their offsets are INCREASED by this hunk's length.
+            out2offi += edit_b.net_added()
+            out2offj += edit_b.net_added()
+            out4offi += edit_b.net_added()
+            out4offj += edit_b.net_added()
+            edit_b = next(it_b)
+        # Check if edit_a's "new range" (j1..j2) ends before edit_b's "old range" (i1..i2)
+        elif edit_b.eof or (not edit_a.eof and edit_a.j2 < edit_b.i2):
+            if not edit_a.equal:
+                # Put edit_a in the 2nd list (could not move down).
+                out2.append(edit_a.offset(out2offi, out2offj))
+                # Stuff that goes in out1 needs to take into account
+                # that this patch is now applied AFTER,
+                # so their offsets are DECREASED by this hunk's length.
+                out1offi -= edit_a.net_added()
+                out1offj -= edit_a.net_added()
+            edit_a = next(it_a)
+        # Check if edit_b's "old range" (i1..i2) ends before edit_a's "new range" (j1..j2)
+        elif edit_a.eof or (not edit_b.eof and edit_b.i2 < edit_a.j2):
+            if not edit_b.equal:
+                # Put edit_b in the 3rd list (could not move up).
+                out3.append(edit_b.offset(out3offi, out3offj))
+                # Stuff that goes in out4 needs to take into account
+                # that this patch is now applied BEFORE,
+                # so their offsets are INCREASED by this hunk's length.
+                out4offi += edit_b.net_added()
+                out4offj += edit_b.net_added()
+                # Stuff that goes in out1 needs to take into account
+                # that this patch is now applied AFTER,
+                # so their offsets are DECREASED by this hunk's length.
+                out1offi -= edit_b.net_added()
+                out1offj -= edit_b.net_added()
+            edit_b = next(it_b)
+        else:
+            # Advance both
+            assert not edit_a.eof and not edit_b.eof and edit_a.j2 == edit_b.j1
+            if not edit_a.equal:
+                # Put edit_a in the 2nd list (could not move down).
+                out2.append(edit_a.offset(out2offi, out2offj))
+                out1offi -= edit_a.net_added()
+                out1offj -= edit_a.net_added()
+            if not edit_b.equal:
+                # Put edit_b in the 3rd list (could not move up).
+                out3.append(edit_b.offset(out3offi, out3offj))
+                out4offi += edit_b.net_added()
+                out4offj += edit_b.net_added()
+                out1offi -= edit_b.net_added()
+                out1offj -= edit_b.net_added()
+            edit_a = next(it_a)
+            edit_b = next(it_b)
+    patch1 = "".join(e.patchlines() for e in out1)
+    patch2 = "".join(e.patchlines() for e in out2)
+    patch3 = "".join(e.patchlines() for e in out3)
+    patch4 = "".join(e.patchlines() for e in out4)
+    return patch1, patch2, patch3, patch4
+
+
+@subcommand
+def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
+    """Swap the given (1-indexed) line with the neighboring commit line.
+
+    If the two commits touch the same files with merge conflicts, split each
+    commit's changes to the shared files into conflicting/clean hunks and
+    emit replacement todo lines so the swap can still proceed.
+
+    If the two commits don't make overlapping edits, but simply adjacent edits
+    (e.g. commit A modifies line 10 and commit B modifies line 11),
+    then this function can be used to swap the two commits
+    without actually identifying any conflicting hunks.
+    """
+    lines = sys.stdin.read().splitlines()
+    assert 1 <= lineno <= len(lines)
+    targetline = parse_sequencer_line(lines[lineno - 1])
+    if targetline is None or not targetline.oid:
+        print(json.dumps({"message": "Please put the cursor on a 'pick' line"}))
+        return
+    dd = 1 if up_or_down == "down" else -1
+    ix = lineno - 1 + dd
+    extra = 0
+    while 0 <= ix < len(lines):
+        line = parse_sequencer_line(lines[ix])
+        if line is None:
+            extra += 1
+            ix += dd
+            continue
+        if not line.oid:
+            # exec, reset, merge -> these are dangerous
+            errmsg = f"Don't want to move past '{line.verb}' command"
+            print(json.dumps({"message": errmsg}))
+            return
+        break
+    else:
+        print(json.dumps({"message": "Nothing to swap with"}))
+        return
+    if up_or_down == "down":
+        first, second = targetline, line
+        first_lineno, second_lineno = lineno, ix + 1
+    else:
+        assert up_or_down == "up"
+        first, second = line, targetline
+        first_lineno, second_lineno = ix + 1, lineno
+    firstfiles = [ns.path for ns in git_show_numstat(first.oid).numstat]
+    secondfiles = [ns.path for ns in git_show_numstat(second.oid).numstat]
+    firstsubj = git_show_commit_subject(first.oid)
+    secondsubj = git_show_commit_subject(second.oid)
+    onlyfirst = [path for path in firstfiles if path not in secondfiles]
+    onlysecond = [path for path in secondfiles if path not in firstfiles]
+    bothfiles = [path for path in secondfiles if path in firstfiles]
+    conflictmessage = move_conflict(up_or_down, targetline.oid, line.oid, bothfiles)
+    if conflictmessage is None:
+        print(json.dumps({"movelines": 1}))
+        return
+    if conflictmessage.error != MERGE_CONFLICT_ERROR:
+        # Only a plain merge conflict can be worked around by splitting hunks;
+        # other reasons (non-commutative, cancelling, ...) abort with a message.
+        print(json.dumps({"message": str(conflictmessage)}))
+        return
+    if git_any_staged_changes():
+        raise SystemExit("refuse to run when there are staged changes")
+    head_sha = git_rev_parse_head()
+    try:
+        # If the two lines are not adjacent commits, replay `second` (shared
+        # files only) on top of `first` to obtain `second_treespec`, the tree
+        # "as if second followed first", used for the hunk-splitting diff.
+        if git_rev_parse(f"{second.oid}^") != git_rev_parse(first.oid):
+            git_set_head(first.oid)
+            if git_apply_cached_from_git_show(second.oid, file_list=bothfiles):
+                raise SystemExit(
+                    f"Cannot apply {second.oid} directly on top of {first.oid}"
+                )
+            second_treespec = git_write_tree()
+        else:
+            second_treespec = second.oid
+        patch1 = patch2 = patch3 = patch4 = ""
+        for path in conflictmessage.paths:
+            with (
+                subprocess.Popen(
+                    ("git", "diff", f"{first.oid}^:{path}", f"{first.oid}:{path}"),
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                ) as first_diff,
+                subprocess.Popen(
+                    ("git", "diff", f"{first.oid}:{path}", f"{second_treespec}:{path}"),
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                ) as second_diff,
+            ):
+                assert first_diff.stdout
+                assert second_diff.stdout
+                p1, p2, p3, p4 = split_diff(first_diff.stdout, second_diff.stdout)
+            patchhead = f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+            if p1:
+                patch1 += f"{patchhead}{p1}"
+            if p2:
+                patch2 += f"{patchhead}{p2}"
+            if p3:
+                patch3 += f"{patchhead}{p3}"
+            if p4:
+                patch4 += f"{patchhead}{p4}"
+        # Now create up to four commits, in sequence:
+        # - Changes from second that do not have a conflict.
+        # - Changes from first that have a conflict.
+        # - Changes from second that have a conflict.
+        # - Changes from first that do not have a conflict.
+        git_set_head_and_staging(f"{first.oid}^", None)
+        replace_first: list[SequencerLine] = []
+        replace_second: list[SequencerLine] = []
+        if patch1 or onlysecond:
+            if patch1:
+                git_apply_cached_unidiff_zero_from_str(patch1)
+            if onlysecond:
+                git_set_staging(second.oid, file_list=onlysecond)
+            git_commit_with_same_authorship(second.oid)
+            replace_first.append(
+                targetline.update(
+                    verb="pick ", oid=git_rev_parse_head(), suffix=secondsubj
+                )
+            )
+        if patch2:
+            git_apply_cached_unidiff_zero_from_str(patch2)
+            git_commit_with_same_authorship(first.oid)
+            commitmsg = f"Conflicts from: {firstsubj}"
+            git_amend_with_commit_msg(commitmsg)
+            replace_first.append(
+                targetline.update(
+                    verb="pick ", oid=git_rev_parse_head(), suffix=commitmsg
+                )
+            )
+        if patch3:
+            git_apply_cached_unidiff_zero_from_str(patch3)
+            git_commit_with_same_authorship(second.oid)
+            replace_second.append(
+                targetline.update(
+                    verb="pick ", oid=git_rev_parse_head(), suffix=commitmsg
+                )
+            )
+        if patch4 or onlyfirst:
+            if patch4:
+                git_apply_cached_unidiff_zero_from_str(patch4)
+            if onlyfirst:
+                git_set_staging(first.oid, file_list=onlyfirst)
+            git_commit_with_same_authorship(first.oid)
+            replace_second.append(
+                targetline.update(
+                    verb="pick ", oid=git_rev_parse_head(), suffix=firstsubj
+                )
+            )
+        # The resulting file after the new four commits
+        # should be equal to the file after the original two commits.
+        assert git_is_same("@", second_treespec), (
+            f"git diff {git_rev_parse_head()} {second_treespec}"
+        )
+
+        # Emit a Vim command to move the cursor without updating the jump list.
+        cursormove = len(replace_first) + len(replace_second) + extra - 1
+        if up_or_down == "down":
+            movement = f"norm {cursormove}j"
+        else:
+            movement = f"norm {cursormove}k"
+        replace_second_line = {
+            "lineno": second_lineno,
+            "s": "\n".join(map(str, replace_second)),
+        }
+        replace_first_line = {
+            "lineno": first_lineno,
+            "s": "\n".join(map(str, replace_first)),
+        }
+        # Emit replacements in the order they should be applied, namely
+        # second before first, as the line numbers below the replacements
+        # may shift around.
+        replacements = [replace_second_line, replace_first_line]
+        print(json.dumps({"replacements": replacements, "command": movement}))
+    finally:
+        git_set_head_and_staging(head_sha, None)
 
 
 if __name__ == "__main__":

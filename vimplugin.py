@@ -1,6 +1,6 @@
 """Vim plugin glue for htime.py (loaded from vimplugin.vim via :py3file).
 
-Exposes htime_move() and htime_cleanup() to Vim: each feeds the gitrebase
+Exposes htime_cmd() to Vim, which feeds the gitrebase
 todo buffer to htime.py on stdin and acts on its JSON output.
 """
 
@@ -36,16 +36,16 @@ if "vim" not in globals():
                 cursor = (1, 0)
 
 
-def htime_move(up_or_down: Literal["down", "up"]) -> None:
-    lineno = vim.eval('line(".")')
+def htime_cmd(cmd: Literal["move", "swap"], up_or_down: Literal["down", "up"]) -> None:
+    initial_lineno = vim.eval('line(".")')
     cmdline = [
         "python3",
         os.path.join(this_dir, "htime.py"),
-        "move",
+        cmd,
         "--up-or-down",
         up_or_down,
         "--lineno",
-        str(lineno),
+        str(initial_lineno),
     ]
     proc = subprocess.run(
         cmdline,
@@ -62,11 +62,24 @@ def htime_move(up_or_down: Literal["down", "up"]) -> None:
         return
     lastline = proc.stdout.splitlines()[-1]
     if lastline.startswith("{"):
-        cmd = json.loads(lastline)
-        if "message" in cmd:
-            vim.command(f"echom {json.dumps(cmd['message'])}")
-        if "movelines" in cmd:
-            mv = cmd["movelines"]
+        result = json.loads(lastline)
+        if "message" in result:
+            vim.command(f"echom {json.dumps(result['message'])}")
+        if "replacements" in result and isinstance(result["replacements"], list):
+            for repl in result["replacements"]:
+                if not isinstance(repl, dict):
+                    continue
+                replineno = repl.get("lineno")
+                if isinstance(replineno, int) and 1 <= replineno <= len(
+                    vim.current.buffer
+                ):
+                    contents = repl.get("s")
+                    if isinstance(contents, str):
+                        vim.current.buffer[replineno - 1 : replineno] = (
+                            contents.splitlines()
+                        )
+        if "movelines" in result:
+            mv = result["movelines"]
             # startrow and endrow are 1-indexed line numbers
             startrow = vim.current.window.cursor[0]
             rows = len(vim.current.buffer)
@@ -84,5 +97,5 @@ def htime_move(up_or_down: Literal["down", "up"]) -> None:
                 vim.command("norm ddGp")
             else:
                 vim.command(f"norm dd{endrow}GP")
-        if "command" in cmd:
-            vim.command(cmd["command"])
+        if "command" in result:
+            vim.command(result["command"])
