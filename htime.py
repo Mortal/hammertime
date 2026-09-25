@@ -517,7 +517,7 @@ def diff_parser(lines: Iterator[str]) -> Iterator[DiffLine]:
     """Yield a DiffLine for every hunk-body line of a single-file unified diff.
 
     The input must start with the five header lines ("diff --git", "index",
-    "--- a/", "+++ b/", "@@ ") followed by exactly one file's hunks.
+    "--- a/", "+++ b/") followed by one or more hunks starting with "@@ ".
     """
     it = iter(lines)
     # TODO: At the moment we don't support mode changes, renames,
@@ -976,7 +976,8 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
             if onlysecond:
                 git_set_staging(second.oid, file_list=onlysecond)
             if moveboth:
-                git_apply_cached_from_git_show(second.oid, file_list=moveboth)
+                if git_apply_cached_from_git_show(second.oid, file_list=moveboth):
+                    raise Exception("unexpected merge conflict (moveboth a)")
             git_commit_with_same_authorship(second.oid)
             replace_first.append(
                 targetline.update(
@@ -1009,7 +1010,8 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
             if onlyfirst:
                 git_set_staging(first.oid, file_list=onlyfirst)
             if moveboth:
-                git_apply_cached_from_git_show(first.oid, file_list=moveboth)
+                if git_apply_cached_from_git_show(first.oid, file_list=moveboth):
+                    raise Exception("unexpected merge conflict (moveboth b)")
             git_commit_with_same_authorship(first.oid)
             replace_second.append(
                 targetline.update(
