@@ -6,6 +6,7 @@ updated list (or a JSON result) is printed on stdout.
 """
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -36,6 +37,7 @@ from hammertime import (
     git_write_tree,
 )
 
+HTIME_DEBUG = bool(os.environ.get("HTIME_DEBUG"))
 
 subcommand, main = make_cliparser(__doc__, "htime", "htime_")
 
@@ -743,6 +745,10 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
             and not edit_a.equal
             and (edit_b.equal and edit_b.i1 <= edit_a.j1 and edit_a.j2 <= edit_b.i2)
         ):
+            if HTIME_DEBUG:
+                print(
+                    f"out4 {edit_b.i1} <= {edit_a.j1} < {edit_a.j2} <= {edit_b.i2} {repr(edit_a.patchlines()[:60])} {out1offi} {out1offj} {out2offi} {out2offj} {out3offi} {out3offj} {out4offi} {out4offj}"
+                )
             # Put edit_a in the 4th list (moved down below).
             out4.append(edit_a.offset(out4offi, out4offj))
             # Stuff that goes in out1,out2,out3 needs to
@@ -761,6 +767,10 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
             and not edit_b.equal
             and (edit_a.equal and edit_a.j1 <= edit_b.i1 and edit_b.i2 <= edit_a.j2)
         ):
+            if HTIME_DEBUG:
+                print(
+                    f"out1 {repr(edit_b.patchlines()[:60])} {out1offi} {out1offj} {out2offi} {out2offj} {out3offi} {out3offj} {out4offi} {out4offj}"
+                )
             # Put edit_b in the 1st list (moved up above).
             out1.append(edit_b.offset(out1offi, out1offj))
             # Stuff that goes in out2,out4 needs to
@@ -774,6 +784,10 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
         # Check if edit_a's "new range" (j1..j2) ends before edit_b's "old range" (i1..i2)
         elif edit_b.eof or (not edit_a.eof and edit_a.j2 < edit_b.i2):
             if not edit_a.equal:
+                if HTIME_DEBUG:
+                    print(
+                        f"out2 {repr(edit_a.patchlines()[:60])} {out1offi} {out1offj} {out2offi} {out2offj} {out3offi} {out3offj} {out4offi} {out4offj}"
+                    )
                 # Put edit_a in the 2nd list (could not move down).
                 out2.append(edit_a.offset(out2offi, out2offj))
                 # Stuff that goes in out1 needs to take into account
@@ -785,6 +799,10 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
         # Check if edit_b's "old range" (i1..i2) ends before edit_a's "new range" (j1..j2)
         elif edit_a.eof or (not edit_b.eof and edit_b.i2 < edit_a.j2):
             if not edit_b.equal:
+                if HTIME_DEBUG:
+                    print(
+                        f"out3 {repr(edit_b.patchlines()[:60])} {out1offi} {out1offj} {out2offi} {out2offj} {out3offi} {out3offj} {out4offi} {out4offj}"
+                    )
                 # Put edit_b in the 3rd list (could not move up).
                 out3.append(edit_b.offset(out3offi, out3offj))
                 # Stuff that goes in out4 needs to take into account
@@ -803,6 +821,10 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
             assert not edit_a.eof and not edit_b.eof
             # Ensure that edit_a's "new range" (j1..j2) ends at the same place as edit_b's "old range" (i1..i2)
             assert edit_a.j2 == edit_b.i2
+            if HTIME_DEBUG:
+                print(
+                    f"both {repr(edit_a.patchlines()[:60])} {repr(edit_b.patchlines()[:60])} {out1offi} {out1offj} {out2offi} {out2offj} {out3offi} {out3offj} {out4offi} {out4offj}"
+                )
             if not edit_a.equal:
                 # Put edit_a in the 2nd list (could not move down).
                 out2.append(edit_a.offset(out2offi, out2offj))
@@ -876,6 +898,10 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
     onlysecond = [path for path in secondfiles if path not in firstfiles]
     bothfiles = [path for path in secondfiles if path in firstfiles]
     conflictmessage = move_conflict(up_or_down, targetline.oid, line.oid, bothfiles)
+    if HTIME_DEBUG:
+        print(
+            "move", up_or_down, targetline.oid, line.oid, bothfiles, conflictmessage
+        )
     if conflictmessage is None:
         print(json.dumps({"movelines": 1}))
         return
@@ -906,6 +932,10 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
             second_treespec = second.oid
         patch1 = patch2 = patch3 = patch4 = ""
         for path in conflictmessage.paths:
+            if HTIME_DEBUG:
+                print(
+                    f"swap {first.oid} {second_treespec} {path}"
+                )
             with (
                 subprocess.Popen(
                     ("git", "diff", f"{first.oid}^:{path}", f"{first.oid}:{path}"),
