@@ -884,6 +884,8 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
         # other reasons (non-commutative, cancelling, ...) abort with a message.
         print(json.dumps({"message": str(conflictmessage)}))
         return
+    # Files where we can swap the two commits by relying on ordinary git cherry-pick.
+    moveboth = [path for path in bothfiles if path not in conflictmessage.paths]
     if git_any_staged_changes():
         raise SystemExit("refuse to run when there are staged changes")
     head_sha = git_rev_parse_head()
@@ -938,11 +940,13 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
         git_set_head_and_staging(f"{first.oid}^", None)
         replace_first: list[SequencerLine] = []
         replace_second: list[SequencerLine] = []
-        if patch1 or onlysecond:
+        if patch1 or onlysecond or moveboth:
             if patch1:
                 git_apply_cached_unidiff_zero_from_str(patch1)
             if onlysecond:
                 git_set_staging(second.oid, file_list=onlysecond)
+            if moveboth:
+                git_apply_cached_from_git_show(second.oid, file_list=moveboth)
             git_commit_with_same_authorship(second.oid)
             replace_first.append(
                 targetline.update(
@@ -969,11 +973,13 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
                     verb="pick ", oid=git_rev_parse_head(), suffix=commitmsg
                 )
             )
-        if patch4 or onlyfirst:
+        if patch4 or onlyfirst or moveboth:
             if patch4:
                 git_apply_cached_unidiff_zero_from_str(patch4)
             if onlyfirst:
                 git_set_staging(first.oid, file_list=onlyfirst)
+            if moveboth:
+                git_apply_cached_from_git_show(first.oid, file_list=moveboth)
             git_commit_with_same_authorship(first.oid)
             replace_second.append(
                 targetline.update(
