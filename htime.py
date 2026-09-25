@@ -802,7 +802,9 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
             edit_b = next(it_b)
         else:
             # Advance both
-            assert not edit_a.eof and not edit_b.eof and edit_a.j2 == edit_b.j1
+            assert not edit_a.eof and not edit_b.eof
+            # Ensure that edit_a's "new range" (j1..j2) ends at the same place as edit_b's "old range" (i1..i2)
+            assert edit_a.j2 == edit_b.i2
             if not edit_a.equal:
                 # Put edit_a in the 2nd list (could not move down).
                 out2.append(edit_a.offset(out2offi, out2offj))
