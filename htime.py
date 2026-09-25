@@ -962,6 +962,8 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
         if patch3:
             git_apply_cached_unidiff_zero_from_str(patch3)
             git_commit_with_same_authorship(second.oid)
+            commitmsg = f"Conflicts from: {secondsubj}"
+            git_amend_with_commit_msg(commitmsg)
             replace_second.append(
                 targetline.update(
                     verb="pick ", oid=git_rev_parse_head(), suffix=commitmsg
