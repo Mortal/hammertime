@@ -734,14 +734,14 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
     out4offi = 0
     out4offj = 0
     while not edit_a.eof or not edit_b.eof:
-        # Check if edit_a's "new range" (j1..j2) fits into edit_b's "old range" (i1..i2)
+        # Check if non-equal edit_a's "new range" (j1..j2) fits into equal edit_b's "old range" (i1..i2).
+        # Note that if any of edit_a or edit_b are at eof, it means the other edit
+        # was NOT inside an equal range, meaning it cannot be moved.
         if (
             not edit_a.eof
+            and not edit_b.eof
             and not edit_a.equal
-            and (
-                edit_b.eof
-                or (edit_b.equal and edit_b.i1 <= edit_a.j1 and edit_a.j2 <= edit_b.i2)
-            )
+            and (edit_b.equal and edit_b.i1 <= edit_a.j1 and edit_a.j2 <= edit_b.i2)
         ):
             # Put edit_a in the 4th list (moved down below).
             out4.append(edit_a.offset(out4offi, out4offj))
@@ -754,14 +754,12 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
             out3offj -= edit_a.net_added()
             out2offj -= edit_a.net_added()
             edit_a = next(it_a)
-        # Check if edit_b's "old range" (i1..i2) fits into edit_a's "new range" (j1..j2)
+        # Check if non-equal edit_b's "old range" (i1..i2) fits into equal edit_a's "new range" (j1..j2)
         elif (
-            not edit_b.eof
+            not edit_a.eof
+            and not edit_b.eof
             and not edit_b.equal
-            and (
-                edit_a.eof
-                or (edit_a.equal and edit_a.j1 <= edit_b.i1 and edit_b.i2 <= edit_a.j2)
-            )
+            and (edit_a.equal and edit_a.j1 <= edit_b.i1 and edit_b.i2 <= edit_a.j2)
         ):
             # Put edit_b in the 1st list (moved up above).
             out1.append(edit_b.offset(out1offi, out1offj))
