@@ -64,14 +64,33 @@ def _parse_numstat(cmdline: tuple[str, ...]) -> list[CommitNumstat]:
 @public
 def git_show_numstat(oid: str) -> CommitNumstat:
     return _parse_numstat(
-        ("git", "show", "--pretty=%H", "--numstat", "--no-renames", oid)
+        (
+            "git",
+            "show",
+            "--pretty=%H",
+            "--numstat",
+            "--no-renames",
+            "--end-of-options",
+            oid,
+            "--",
+        )
     )[0]
 
 
 @public
 def git_log_numstat(refspec: str) -> list[CommitNumstat]:
     return _parse_numstat(
-        ("git", "log", "--reverse", "--pretty=%H", "--numstat", "--no-renames", refspec)
+        (
+            "git",
+            "log",
+            "--reverse",
+            "--pretty=%H",
+            "--numstat",
+            "--no-renames",
+            "--end-of-options",
+            refspec,
+            "--",
+        )
     )
 
 
