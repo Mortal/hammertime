@@ -899,9 +899,7 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
     bothfiles = [path for path in secondfiles if path in firstfiles]
     conflictmessage = move_conflict(up_or_down, targetline.oid, line.oid, bothfiles)
     if HTIME_DEBUG:
-        print(
-            "move", up_or_down, targetline.oid, line.oid, bothfiles, conflictmessage
-        )
+        print("move", up_or_down, targetline.oid, line.oid, bothfiles, conflictmessage)
     if conflictmessage is None:
         print(json.dumps({"movelines": 1}))
         return
@@ -933,9 +931,7 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
         patch1 = patch2 = patch3 = patch4 = ""
         for path in conflictmessage.paths:
             if HTIME_DEBUG:
-                print(
-                    f"swap {first.oid} {second_treespec} {path}"
-                )
+                print(f"swap {first.oid} {second_treespec} {path}")
             with (
                 subprocess.Popen(
                     ("git", "diff", f"{first.oid}^:{path}", f"{first.oid}:{path}"),

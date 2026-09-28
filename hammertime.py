@@ -337,7 +337,9 @@ def git_amend(file_list: list[str] | tuple[str, ...] | None) -> None:
 
 
 @public
-def git_amend_with_commit_msg(commit_msg: str, file_list: list[str] | None = None) -> None:
+def git_amend_with_commit_msg(
+    commit_msg: str, file_list: list[str] | None = None
+) -> None:
     cmdline = [
         "git",
         "commit",
