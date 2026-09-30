@@ -919,9 +919,7 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
         # "as if second followed first", used for the hunk-splitting diff.
         if git_rev_parse(f"{second.oid}^") != git_rev_parse(first.oid):
             git_set_head_and_staging(first.oid, None)
-            if git_apply_cached_from_git_show(
-                second.oid, file_list=conflictmessage.paths
-            ):
+            if git_apply_cached_from_git_show(second.oid):
                 raise SystemExit(
                     f"Cannot apply {second.oid} directly on top of {first.oid}"
                 )
@@ -970,7 +968,7 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
             if patch1:
                 git_apply_cached_unidiff_zero_from_str(patch1)
             if onlysecond:
-                git_set_staging(second.oid, file_list=onlysecond)
+                git_set_staging(second_treespec, file_list=onlysecond)
             if moveboth:
                 if git_apply_cached_from_git_show(second.oid, file_list=moveboth):
                     raise Exception("unexpected merge conflict (moveboth a)")
