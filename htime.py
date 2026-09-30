@@ -916,8 +916,8 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
         raise SystemExit("refuse to run when there are staged changes")
     head_sha = git_rev_parse_head()
     try:
-        # If the two lines are not adjacent commits, replay `second` (shared
-        # files only) on top of `first` to obtain `second_treespec`, the tree
+        # If the two lines are not adjacent commits, replay `second`
+        # on top of `first` to obtain `second_treespec`, the tree
         # "as if second followed first", used for the hunk-splitting diff.
         if git_rev_parse(f"{second.oid}^") != git_rev_parse(first.oid):
             git_set_head_and_staging(first.oid, None)
