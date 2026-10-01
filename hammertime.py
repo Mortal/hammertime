@@ -95,6 +95,16 @@ def git_log_numstat(refspec: str) -> list[CommitNumstat]:
 
 
 @public
+def git_get_file_mode(path: str) -> str:
+    cmdline = ["git", "ls-files", "-zsc", path]
+    if DEBUG_GIT_COMMANDS:
+        print(*cmdline, flush=True)
+    mode = subprocess.check_output(cmdline).split()[0].decode()
+    assert mode in ("100644", "100755"), mode
+    return mode
+
+
+@public
 def git_rev_parse_head() -> str:
     res = git_rev_parse("HEAD")
     assert res is not None
@@ -126,6 +136,14 @@ def git_write_empty_blob() -> str:
         universal_newlines=True,
         stdin=subprocess.DEVNULL,
     ).strip()
+
+
+@public
+def git_write_blob(contents: bytes) -> str:
+    cmdline = ["git", "hash-object", "-w", "--stdin"]
+    if DEBUG_GIT_COMMANDS:
+        print(*cmdline, flush=True)
+    return subprocess.check_output(cmdline, input=contents).decode().strip()
 
 
 @public
@@ -181,8 +199,12 @@ def git_write_tree() -> str:
 
 
 @public
-def git_files_with_unstaged_changes() -> list[str]:
+def git_files_with_unstaged_changes(
+    *, file_list: list[str] | tuple[str, ...] | None = None
+) -> list[str]:
     cmdline = ["git", "diff", "--name-only", "-z"]
+    if file_list is not None:
+        cmdline += ["--", *file_list]
     if DEBUG_GIT_COMMANDS:
         print("$", *cmdline, flush=True)
     diff_filenames = subprocess.check_output(cmdline, text=True).rstrip("\0")
@@ -254,6 +276,30 @@ def git_set_staging(
     if DEBUG_GIT_COMMANDS:
         print(*cmdline, flush=True)
     subprocess.check_call(cmdline, cwd=cwd)
+
+
+@public
+def git_cat_file(
+    refspec: str,
+    cwd: str | None = None,
+) -> bytes:
+    cmdline = ["git", "cat-file", "-p", "--end-of-options", refspec]
+    if DEBUG_GIT_COMMANDS:
+        print(*cmdline, flush=True)
+    return subprocess.check_output(cmdline, cwd=cwd)
+
+
+@public
+def git_show(
+    refspec: str,
+    cwd: str | None = None,
+    *,
+    file_list: list[str] | tuple[str, ...] | None = None,
+) -> bytes:
+    cmdline = ["git", "show", "--end-of-options", refspec, "--", *(file_list or [])]
+    if DEBUG_GIT_COMMANDS:
+        print(*cmdline, flush=True)
+    return subprocess.check_output(cmdline, cwd=cwd)
 
 
 @public
