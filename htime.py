@@ -846,6 +846,155 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
     return patch1, patch2, patch3, patch4
 
 
+def htime_split_inner(
+    firstoid: str,
+    secondoid: str,
+    firstfiles: list[str],
+    secondfiles: list[str],
+    bothfiles: list[str],
+    conflictpaths: list[str],
+):
+    # Files where we can swap the two commits by relying on ordinary git cherry-pick.
+    firstsubj = git_show_commit_subject(firstoid)
+    secondsubj = git_show_commit_subject(secondoid)
+    onlyfirst = [path for path in firstfiles if path not in secondfiles]
+    onlysecond = [path for path in secondfiles if path not in firstfiles]
+    moveboth = [path for path in bothfiles if path not in conflictpaths]
+    if git_any_staged_changes():
+        raise SystemExit("refuse to run when there are staged changes")
+    head_sha = git_rev_parse_head()
+    try:
+        # If the two lines are not adjacent commits, replay `second`
+        # on top of `first` to obtain `second_treespec`, the tree
+        # "as if second followed first", used for the hunk-splitting diff.
+        if git_rev_parse(f"{secondoid}^") != git_rev_parse(firstoid):
+            git_set_head_and_staging(firstoid, None)
+            if git_apply_cached_from_git_show(secondoid):
+                raise SystemExit(
+                    f"Cannot apply {secondoid} directly on top of {firstoid}"
+                )
+            second_treespec = git_write_tree()
+        else:
+            second_treespec = secondoid
+        patch1 = patch2 = patch3 = patch4 = ""
+        for path in conflictpaths:
+            if HTIME_DEBUG:
+                print(f"swap {firstoid} {second_treespec} {path}")
+            with (
+                subprocess.Popen(
+                    ("git", "diff", f"{firstoid}^:{path}", f"{firstoid}:{path}"),
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                ) as first_diff,
+                subprocess.Popen(
+                    ("git", "diff", f"{firstoid}:{path}", f"{second_treespec}:{path}"),
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                ) as second_diff,
+            ):
+                assert first_diff.stdout
+                assert second_diff.stdout
+                p1, p2, p3, p4 = split_diff(first_diff.stdout, second_diff.stdout)
+            patchhead = f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+            if p1:
+                patch1 += f"{patchhead}{p1}"
+            if p2:
+                patch2 += f"{patchhead}{p2}"
+            if p3:
+                patch3 += f"{patchhead}{p3}"
+            if p4:
+                patch4 += f"{patchhead}{p4}"
+        # Now create up to four commits, in sequence:
+        # - Changes from second that do not have a conflict.
+        # - Changes from first that have a conflict.
+        # - Changes from second that have a conflict.
+        # - Changes from first that do not have a conflict.
+        git_set_head_and_staging(f"{firstoid}^", None)
+        result1: tuple[str, str] | None = None
+        result2: tuple[str, str] | None = None
+        result3: tuple[str, str] | None = None
+        result4: tuple[str, str] | None = None
+        if patch1 or onlysecond or moveboth:
+            if patch1:
+                git_apply_cached_unidiff_zero_from_str(patch1)
+            if onlysecond:
+                git_set_staging(second_treespec, file_list=onlysecond)
+            if moveboth:
+                if git_apply_cached_from_git_show(secondoid, file_list=moveboth):
+                    raise Exception("unexpected merge conflict (moveboth a)")
+            git_commit_with_same_authorship(secondoid)
+            result1 = (git_rev_parse_head(), secondsubj)
+        if patch2:
+            git_apply_cached_unidiff_zero_from_str(patch2)
+            git_commit_with_same_authorship(firstoid)
+            commitmsg = f"Conflicts from: {firstsubj}"
+            git_amend_with_commit_msg(commitmsg)
+            result2 = (git_rev_parse_head(), commitmsg)
+        if patch3:
+            git_apply_cached_unidiff_zero_from_str(patch3)
+            git_commit_with_same_authorship(secondoid)
+            commitmsg = f"Conflicts from: {secondsubj}"
+            git_amend_with_commit_msg(commitmsg)
+            result3 = (git_rev_parse_head(), commitmsg)
+        if patch4 or onlyfirst or moveboth:
+            if patch4:
+                git_apply_cached_unidiff_zero_from_str(patch4)
+            if onlyfirst:
+                git_set_staging(firstoid, file_list=onlyfirst)
+            if moveboth:
+                if git_apply_cached_from_git_show(firstoid, file_list=moveboth):
+                    raise Exception("unexpected merge conflict (moveboth b)")
+            git_commit_with_same_authorship(firstoid)
+            result4 = (git_rev_parse_head(), firstsubj)
+        # The resulting file after the new four commits
+        # should be equal to the file after the original two commits.
+        assert git_is_same("@", second_treespec), (
+            f"git diff {git_rev_parse_head()} {second_treespec}"
+        )
+    finally:
+        git_set_head_and_staging(head_sha, None)
+    return result1, result2, result3, result4
+
+
+@subcommand
+def htime_split(first: str, second: str) -> None:
+    firstfiles = [ns.path for ns in git_show_numstat(first).numstat]
+    secondfiles = [ns.path for ns in git_show_numstat(second).numstat]
+    bothfiles = [path for path in secondfiles if path in firstfiles]
+    conflictmessage = move_conflict("down", first, second, bothfiles)
+    if conflictmessage is None:
+        print(f"# Commits can be trivially swapped\npick {second}\npick {first}")
+        return
+    if conflictmessage.error != MERGE_CONFLICT_ERROR:
+        raise SystemExit(str(conflictmessage))
+    result1, result2, result3, result4 = htime_split_inner(
+        first,
+        second,
+        firstfiles,
+        secondfiles,
+        bothfiles,
+        conflictpaths=conflictmessage.paths,
+    )
+    if result1 is None:
+        print("# (nothing from 2nd commit can move up)")
+    else:
+        print(f"pick {result1[0][:12]} # {result1[1]}")
+    if result2 is None:
+        print("# (nothing from 1st commit has a conflict)")
+    else:
+        print(f"pick {result2[0][:12]} # {result2[1]}")
+    if result3 is None:
+        print("# (nothing from 2nd commit has a conflict)")
+    else:
+        print(f"pick {result3[0][:12]} # {result3[1]}")
+    if result4 is None:
+        print("# (nothing from 1st commit can move down)")
+    else:
+        print(f"pick {result4[0][:12]} # {result4[1]}")
+
+
 @subcommand
 def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
     """Swap the given (1-indexed) line with the neighboring commit line.
@@ -892,10 +1041,6 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
         first_lineno, second_lineno = ix + 1, lineno
     firstfiles = [ns.path for ns in git_show_numstat(first.oid).numstat]
     secondfiles = [ns.path for ns in git_show_numstat(second.oid).numstat]
-    firstsubj = git_show_commit_subject(first.oid)
-    secondsubj = git_show_commit_subject(second.oid)
-    onlyfirst = [path for path in firstfiles if path not in secondfiles]
-    onlysecond = [path for path in secondfiles if path not in firstfiles]
     bothfiles = [path for path in secondfiles if path in firstfiles]
     conflictmessage = move_conflict(up_or_down, targetline.oid, line.oid, bothfiles)
     if HTIME_DEBUG:
@@ -908,137 +1053,51 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
         # other reasons (non-commutative, cancelling, ...) abort with a message.
         print(json.dumps({"message": str(conflictmessage)}))
         return
-    # Files where we can swap the two commits by relying on ordinary git cherry-pick.
-    moveboth = [path for path in bothfiles if path not in conflictmessage.paths]
-    if git_any_staged_changes():
-        raise SystemExit("refuse to run when there are staged changes")
-    head_sha = git_rev_parse_head()
-    try:
-        # If the two lines are not adjacent commits, replay `second`
-        # on top of `first` to obtain `second_treespec`, the tree
-        # "as if second followed first", used for the hunk-splitting diff.
-        if git_rev_parse(f"{second.oid}^") != git_rev_parse(first.oid):
-            git_set_head_and_staging(first.oid, None)
-            if git_apply_cached_from_git_show(second.oid):
-                raise SystemExit(
-                    f"Cannot apply {second.oid} directly on top of {first.oid}"
-                )
-            second_treespec = git_write_tree()
-        else:
-            second_treespec = second.oid
-        patch1 = patch2 = patch3 = patch4 = ""
-        for path in conflictmessage.paths:
-            if HTIME_DEBUG:
-                print(f"swap {first.oid} {second_treespec} {path}")
-            with (
-                subprocess.Popen(
-                    ("git", "diff", f"{first.oid}^:{path}", f"{first.oid}:{path}"),
-                    text=True,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                ) as first_diff,
-                subprocess.Popen(
-                    ("git", "diff", f"{first.oid}:{path}", f"{second_treespec}:{path}"),
-                    text=True,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                ) as second_diff,
-            ):
-                assert first_diff.stdout
-                assert second_diff.stdout
-                p1, p2, p3, p4 = split_diff(first_diff.stdout, second_diff.stdout)
-            patchhead = f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
-            if p1:
-                patch1 += f"{patchhead}{p1}"
-            if p2:
-                patch2 += f"{patchhead}{p2}"
-            if p3:
-                patch3 += f"{patchhead}{p3}"
-            if p4:
-                patch4 += f"{patchhead}{p4}"
-        # Now create up to four commits, in sequence:
-        # - Changes from second that do not have a conflict.
-        # - Changes from first that have a conflict.
-        # - Changes from second that have a conflict.
-        # - Changes from first that do not have a conflict.
-        git_set_head_and_staging(f"{first.oid}^", None)
-        replace_first: list[SequencerLine] = []
-        replace_second: list[SequencerLine] = []
-        if patch1 or onlysecond or moveboth:
-            if patch1:
-                git_apply_cached_unidiff_zero_from_str(patch1)
-            if onlysecond:
-                git_set_staging(second_treespec, file_list=onlysecond)
-            if moveboth:
-                if git_apply_cached_from_git_show(second.oid, file_list=moveboth):
-                    raise Exception("unexpected merge conflict (moveboth a)")
-            git_commit_with_same_authorship(second.oid)
-            replace_first.append(
-                targetline.update(
-                    verb="pick ", oid=git_rev_parse_head(), suffix=secondsubj
-                )
-            )
-        if patch2:
-            git_apply_cached_unidiff_zero_from_str(patch2)
-            git_commit_with_same_authorship(first.oid)
-            commitmsg = f"Conflicts from: {firstsubj}"
-            git_amend_with_commit_msg(commitmsg)
-            replace_first.append(
-                targetline.update(
-                    verb="pick ", oid=git_rev_parse_head(), suffix=commitmsg
-                )
-            )
-        if patch3:
-            git_apply_cached_unidiff_zero_from_str(patch3)
-            git_commit_with_same_authorship(second.oid)
-            commitmsg = f"Conflicts from: {secondsubj}"
-            git_amend_with_commit_msg(commitmsg)
-            replace_second.append(
-                targetline.update(
-                    verb="pick ", oid=git_rev_parse_head(), suffix=commitmsg
-                )
-            )
-        if patch4 or onlyfirst or moveboth:
-            if patch4:
-                git_apply_cached_unidiff_zero_from_str(patch4)
-            if onlyfirst:
-                git_set_staging(first.oid, file_list=onlyfirst)
-            if moveboth:
-                if git_apply_cached_from_git_show(first.oid, file_list=moveboth):
-                    raise Exception("unexpected merge conflict (moveboth b)")
-            git_commit_with_same_authorship(first.oid)
-            replace_second.append(
-                targetline.update(
-                    verb="pick ", oid=git_rev_parse_head(), suffix=firstsubj
-                )
-            )
-        # The resulting file after the new four commits
-        # should be equal to the file after the original two commits.
-        assert git_is_same("@", second_treespec), (
-            f"git diff {git_rev_parse_head()} {second_treespec}"
+    result1, result2, result3, result4 = htime_split_inner(
+        first.oid,
+        second.oid,
+        firstfiles,
+        secondfiles,
+        bothfiles,
+        conflictpaths=conflictmessage.paths,
+    )
+    replace_first: list[SequencerLine] = []
+    replace_second: list[SequencerLine] = []
+    if result1 is not None:
+        replace_first.append(
+            targetline.update(verb="pick ", oid=result1[0], suffix=result1[1])
         )
-
-        # Emit a Vim command to move the cursor without updating the jump list.
-        cursormove = len(replace_first) + len(replace_second) + extra - 1
-        if up_or_down == "down":
-            movement = f"norm {cursormove}j"
-        else:
-            movement = f"norm {cursormove}k"
-        replace_second_line = {
-            "lineno": second_lineno,
-            "s": "\n".join(map(str, replace_second)),
-        }
-        replace_first_line = {
-            "lineno": first_lineno,
-            "s": "\n".join(map(str, replace_first)),
-        }
-        # Emit replacements in the order they should be applied, namely
-        # second before first, as the line numbers below the replacements
-        # may shift around.
-        replacements = [replace_second_line, replace_first_line]
-        print(json.dumps({"replacements": replacements, "command": movement}))
-    finally:
-        git_set_head_and_staging(head_sha, None)
+    if result2 is not None:
+        replace_first.append(
+            targetline.update(verb="pick ", oid=result2[0], suffix=result2[1])
+        )
+    if result3 is not None:
+        replace_second.append(
+            targetline.update(verb="pick ", oid=result3[0], suffix=result3[1])
+        )
+    if result4 is not None:
+        replace_second.append(
+            targetline.update(verb="pick ", oid=result4[0], suffix=result4[1])
+        )
+    # Emit a Vim command to move the cursor without updating the jump list.
+    cursormove = len(replace_first) + len(replace_second) + extra - 1
+    if up_or_down == "down":
+        movement = f"norm {cursormove}j"
+    else:
+        movement = f"norm {cursormove}k"
+    replace_second_line = {
+        "lineno": second_lineno,
+        "s": "\n".join(map(str, replace_second)),
+    }
+    replace_first_line = {
+        "lineno": first_lineno,
+        "s": "\n".join(map(str, replace_first)),
+    }
+    # Emit replacements in the order they should be applied, namely
+    # second before first, as the line numbers below the replacements
+    # may shift around.
+    replacements = [replace_second_line, replace_first_line]
+    print(json.dumps({"replacements": replacements, "command": movement}))
 
 
 if __name__ == "__main__":
