@@ -99,9 +99,9 @@ def parse_git_patch(thepatch: str) -> tuple[str, str]:
     commit_hash = mo.group(1)
     # Peel off, in order: the commit/author/date header block, the diff body,
     # and the "---" separator, leaving just the commit message.
-    headers, sep, mainmatter = thepatch.partition("\n\n")
-    commit_message, sep, rest = mainmatter.partition("\ndiff --git ")
-    commit_message, sep, rest = commit_message.partition("\n---\n")
+    _headers, _, mainmatter = thepatch.partition("\n\n")
+    commit_message, _, _rest = mainmatter.partition("\ndiff --git ")
+    commit_message, _, _rest = commit_message.partition("\n---\n")
     return commit_hash, textwrap.dedent(commit_message.strip("\n"))
 
 
@@ -119,8 +119,7 @@ def htime_write_inner(patchlines: str, oidlen: int) -> TodoEdits:
     commit_hash_patch, commit_msg = parse_git_patch(patchlines)
     commit_hash = git_rev_parse(commit_hash_patch)
     assert commit_hash
-    head_sha = git_rev_parse("HEAD")
-    assert head_sha
+    head_sha = git_rev_parse_head()
     commit_msg_change = (
         commit_msg and git_show_commit_message(commit_hash) != commit_msg
     )
@@ -153,8 +152,7 @@ def htime_write_inner(patchlines: str, oidlen: int) -> TodoEdits:
             git_set_head(f"{commit_hash}^")
             git_commit_with_same_authorship(commit_hash)
             git_amend_with_commit_msg(commit_msg)
-            newhead = git_rev_parse("HEAD")
-            assert newhead
+            newhead = git_rev_parse_head()
             subject = commit_msg.splitlines()[0]
             res: TodoEdits = {"replace": f"pick {newhead} {subject}".rstrip()}
             print("No hand-edited files, just a commit message update")
@@ -164,8 +162,7 @@ def htime_write_inner(patchlines: str, oidlen: int) -> TodoEdits:
         git_commit_with_same_authorship(commit_hash)
         if commit_msg_change:
             git_amend_with_commit_msg(commit_msg)
-        hammer1 = git_rev_parse("HEAD")
-        assert hammer1
+        hammer1 = git_rev_parse_head()
         if commit_msg_change:
             res = {"justbelow": f"f -C {hammer1} {subject}".rstrip()}
         else:
@@ -175,8 +172,7 @@ def htime_write_inner(patchlines: str, oidlen: int) -> TodoEdits:
         git_set_staging(commit_hash, cwd=toplevel)
         git_commit_with_same_authorship(commit_hash)
         git_amend_with_commit_msg(revertsubject)
-        hammer2 = git_rev_parse("HEAD")
-        assert hammer2
+        hammer2 = git_rev_parse_head()
         res["movedown"] = f"pick {hammer2} {revertsubject}".rstrip()
         return res
     finally:
@@ -328,14 +324,12 @@ def parse_sequencer_line(
             "drop",
             "l",
             "label",
-            "b",
-            "break",
             "u",
             "update-ref",
         ):
             # These are safe to move past - pretend they don't match
             return None
-        # exec, reset, merge -> these are dangerous
+        # break, exec, reset, merge -> these are dangerous
         return SequencerLine(otherverb, "", "", otherarg)
     if like:
         oid = oid[: len(like.oid)]
@@ -480,7 +474,7 @@ def htime_move(lineno: int, up_or_down: Literal["down", "up"]) -> None:
             ix += dd
             continue
         if not line.oid:
-            # exec, reset, merge -> these are dangerous
+            # break, exec, reset, merge -> these are dangerous
             conflictmessage = f"Don't want to move past '{line.verb}' command"
             break
         conflictmessage = move_conflict(up_or_down, moveoid, line.oid, movefiles)
@@ -523,11 +517,11 @@ def diff_parser(lines: Iterator[str]) -> Iterator[DiffLine]:
     # TODO: At the moment we don't support mode changes, renames,
     # similarity-index, or binary-diff lines.
     diffline: str | None = next(it, None)
-    assert diffline is not None and diffline.startswith("diff --git ")
+    assert diffline is not None and diffline.startswith("diff --git "), diffline
     diffline = next(it, None)
     assert diffline is not None and diffline.startswith("index ")
     diffline = next(it, None)
-    assert diffline is not None and diffline.startswith("--- a/")
+    assert diffline is not None and diffline.startswith("--- a/"), diffline
     diffline = next(it, None)
     assert diffline is not None and diffline.startswith("+++ b/")
     diffline = next(it, None)
@@ -597,13 +591,13 @@ class Edit:
         assert self.tolines is not None
         return False
 
-    def offset(self, offi: int, offj: int) -> "Edit":
+    def offset(self, off: int, offj: int = 0) -> "Edit":
         """Return a copy with the old/new ranges shifted by the given amounts."""
         result = Edit(
-            i1=self.i1 + offi,
-            i2=self.i2 + offi,
-            j1=self.j1 + offj,
-            j2=self.j2 + offj,
+            i1=self.i1 + off,
+            i2=self.i2 + off,
+            j1=self.j1 + off + offj,
+            j2=self.j2 + off + offj,
             fromlines=self.fromlines,
             tolines=self.tolines,
         )
@@ -614,6 +608,12 @@ class Edit:
         return self.j2 - self.j1 - (self.i2 - self.i1)
 
     def range_str(self) -> str:
+        """Render this edit as a unified-diff `@@ -a,b +c,d @@` range body.
+
+        Inverse of the 0-based conversion done in diff_parser: re-applies the
+        1-based numbering and the zero-length-range convention, and emits the
+        special EOF / `==` forms for eof and equal edits.
+        """
         i1 = self.i1
         i2 = self.i2
         j1 = self.j1
@@ -637,6 +637,10 @@ class Edit:
         return f"-{i1},{i2 - i1} +{j1},{j2 - j1}"
 
     def patchlines(self) -> str:
+        """Render this edit as a hunk body ("@@ ... @@" plus -/+ lines).
+
+        Returns "" for equal/eof edits, which carry no +/- content.
+        """
         if self.fromlines is None or self.tolines is None:
             return ""
         fromlines = "".join(f"-{line}" for line in self.fromlines)
@@ -654,66 +658,210 @@ def opcodes_from_difflines(difflines: Iterator[DiffLine]) -> Iterator[Edit]:
     diffline: DiffLine | None = next(it, None)
     if diffline is None:
         raise Exception("opcodes_from_difflines got an empty input")
-    first = True
+    i1 = j1 = 0
     while diffline is not None:
         if diffline.diffline.startswith(" "):
-            if first:
-                i1 = j1 = 0
-            else:
-                i1 = diffline.fromline
-                j1 = diffline.toline
-            first = False
-            i2 = diffline.fromline + 1
-            j2 = diffline.toline + 1
             diffline = next(it, None)
-            while diffline is not None and diffline.diffline.startswith(" "):
-                i2 = diffline.fromline + 1
-                j2 = diffline.toline + 1
-                diffline = next(it, None)
-            yield Edit(i1=i1, j1=j1, i2=i2, j2=j2)
-        else:
-            if first:
-                assert diffline.fromline == diffline.toline, diffline
-                if diffline.fromline >= 1:
-                    yield Edit(
-                        i1=0,
-                        j1=0,
-                        i2=diffline.fromline,
-                        j2=diffline.toline,
-                    )
-            first = False
-            i1 = diffline.fromline
-            j1 = diffline.toline
-            fromlines: list[str] = []
-            tolines: list[str] = []
-            while diffline is not None and not diffline.diffline.startswith(" "):
-                assert diffline.fromline == i1 + len(fromlines), (
-                    diffline,
-                    i1,
-                    len(fromlines),
-                )
-                assert diffline.toline == j1 + len(tolines)
-                if diffline.diffline.startswith("-"):
-                    fromlines.append(diffline.diffline[1:])
-                else:
-                    assert diffline.diffline.startswith("+")
-                    tolines.append(diffline.diffline[1:])
-                diffline = next(it, None)
-            i2 = i1 + len(fromlines)
-            j2 = j1 + len(tolines)
-            yield Edit(
-                i1=i1,
-                j1=j1,
-                i2=i2,
-                j2=j2,
-                fromlines=tuple(fromlines),
-                tolines=tuple(tolines),
-            )
-    # Yield special "eof" Edit (two empty ranges old[i2:i2] to new[j2:j2])
-    yield Edit(i1=i2, j1=j2, i2=i2, j2=j2)
+            continue
+        skipi = diffline.fromline - i1
+        skipj = diffline.toline - j1
+        assert skipi == skipj, (skipi, skipj, diffline)
+        if skipi > 0:
+            yield Edit(i1=i1, j1=j1, i2=diffline.fromline, j2=diffline.toline)
+        i1 = diffline.fromline
+        j1 = diffline.toline
+        fromlines: list[str] = []
+        tolines: list[str] = []
+        while (
+            diffline is not None
+            and not diffline.diffline.startswith(" ")
+            and diffline.fromline == i1 + len(fromlines)
+            and diffline.toline == j1 + len(tolines)
+        ):
+            if diffline.diffline.startswith("-"):
+                fromlines.append(diffline.diffline[1:])
+            else:
+                assert diffline.diffline.startswith("+")
+                tolines.append(diffline.diffline[1:])
+            diffline = next(it, None)
+        yield Edit(
+            i1=i1,
+            j1=j1,
+            i2=i1 + len(fromlines),
+            j2=j1 + len(tolines),
+            fromlines=tuple(fromlines),
+            tolines=tuple(tolines),
+        )
+        i1 += len(fromlines)
+        j1 += len(tolines)
+    # Yield special "eof" Edit (two empty ranges old[i1:i1] to new[j1:j1])
+    yield Edit(i1=i1, j1=j1, i2=i1, j2=j1)
 
 
-def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
+TESTS = [
+    # Test only modifying lines, not adding/removing lines,
+    # with different combinations of overlap and near-overlap.
+    (
+        "-A---A--A-AA-AA-A---A--",
+        "---B--B-B-B---B-BB-BB-B",
+    ),
+    # Common case: Only near-overlap, no actual overlap.
+    (
+        "-A- -A----A- -A-",
+        "- -B--B--B--B---",
+    ),
+    # The next tests all start with four B,A,B,A insertions
+    # that set the counters to sum1=1, sum2=2, sum3=4, sum4=8,
+    # followed by different cases that test that the offsets
+    # are applied correctly.
+    (
+        " -AA    ---AAAAAAAA-A---",
+        "B-  BBBB---        ---B-",
+    ),
+    (
+        " -AA    ---AAAAAAAA---A-",
+        "B-  BBBB---        -B---",
+    ),
+    (
+        " -AA    ---AAAAAAAA-A-",
+        "B-  BBBB---        ---",
+    ),
+    (
+        " -AA    ---AAAAAAAA---",
+        "B-  BBBB---        -B-",
+    ),
+    (
+        " -AA    ---AAAAAAAA-AA--A-",
+        "B-  BBBB---        --BB-B-",
+    ),
+]
+
+
+def run_tests() -> None:
+    """Self-test: split two synthetic overlapping diffs and re-apply them.
+
+    Builds three versions (v0, v1=A-applied, v2=B-applied) from the terse
+    TESTS tables, computes diffs A (v0->v1) and B (v1->v2), splits them via
+    split_diff() into four reordered patches, applies those in order, and
+    asserts the result equals v2. Run via `htime.py --test`.
+    """
+    import difflib
+
+    def apply_patch(lines: Iterator[str], edits: Iterator[Edit]) -> Iterator[str]:
+        "Only used for tests: Apply a patch to a file's lines."
+        it = iter(lines)
+        for edit in edits:
+            if edit.eof:
+                yield from it
+                return
+            if edit.equal:
+                for _ in range(edit.i1, edit.i2):
+                    try:
+                        next_line = next(it)
+                    except StopIteration:
+                        raise Exception("lines ended before edits finish")
+                    yield next_line
+            else:
+                assert edit.fromlines is not None
+                assert edit.tolines is not None
+                for expected in edit.fromlines:
+                    try:
+                        next_line = next(it)
+                    except StopIteration:
+                        raise Exception("lines ended before edits finish")
+                    if next_line != expected:
+                        raise Exception("patch does not apply")
+                yield from edit.tolines
+
+    for line_a, line_b in TESTS:
+        # Expand the two shorthand lines into initial file (v0),
+        # file after A (v1), file after B (v2).
+        v0: list[str] = []
+        v1: list[str] = []
+        v2: list[str] = []
+        for pair in zip(line_a, line_b, strict=True):
+            if pair == ("-", "-"):
+                # Unchanged context line
+                line = f"initial {len(v0)}"
+                v0.append(f"{line}\n")
+                v1.append(f"{line}\n")
+                v2.append(f"{line}\n")
+            elif pair == ("A", "-"):
+                # Modified by A, not modified by B
+                line = f"initial {len(v0)}"
+                edit = f"{line} AAAA"
+                v0.append(f"{line}\n")
+                v1.append(f"{edit}\n")
+                v2.append(f"{edit}\n")
+            elif pair == ("-", "B"):
+                # Modified by B, not modified by A
+                line = f"initial {len(v0)}"
+                edit = f"{line} BBBB"
+                v0.append(f"{line}\n")
+                v1.append(f"{line}\n")
+                v2.append(f"{edit}\n")
+            elif pair == ("A", " "):
+                # Inserted in A, deleted in B
+                v1.append(f"INSERT A {len(v1)}\n")
+            elif pair == (" ", "B"):
+                # Inserted in B
+                v2.append(f"INSERT B {len(v2)}\n")
+            elif pair == ("A", "B"):
+                # Modified by A, then modified by B
+                v1.append(f"INSERT A {len(v1)}\n")
+                v2.append(f"INSERT B {len(v2)}\n")
+            else:
+                raise Exception(pair)
+        # Compute the two unified diffs A (v0->v1) and B (v1->v2).
+        diff_a = "".join(difflib.unified_diff(v0, v1, "a/", "b/"))
+        diff_b = "".join(difflib.unified_diff(v1, v2, "a/", "b/"))
+        dummy_header = "diff --git dummy\nindex dummy\n"
+        # Apply the diff-splitter to obtain four patches p1,p2,p3,p4.
+        p1, p2, p3, p4 = split_diff(
+            f"{dummy_header}{diff_a}".splitlines(True),
+            f"{dummy_header}{diff_b}".splitlines(True),
+        )
+        head = f"{dummy_header}--- a/\n+++ b/\n"
+        # Apply the patches in order.
+        result = v0
+        if p1:
+            p1difflines = list(diff_parser(f"{head}{p1}".splitlines(True)))
+            p1edits = list(opcodes_from_difflines(p1difflines))
+            result = "".join(apply_patch(result, p1edits)).splitlines(True)
+        if p2:
+            p2difflines = list(diff_parser(f"{head}{p2}".splitlines(True)))
+            p2edits = list(opcodes_from_difflines(p2difflines))
+            result = "".join(apply_patch(result, p2edits)).splitlines(True)
+        if p3:
+            p3difflines = list(diff_parser(f"{head}{p3}".splitlines(True)))
+            p3edits = list(opcodes_from_difflines(p3difflines))
+            result = "".join(apply_patch(result, p3edits)).splitlines(True)
+        if p4:
+            p4difflines = list(diff_parser(f"{head}{p4}".splitlines(True)))
+            p4edits = list(opcodes_from_difflines(p4difflines))
+            result = "".join(apply_patch(result, p4edits)).splitlines(True)
+        # Ensure that the four patches result in the expected final file.
+        assert result == v2
+
+
+def split_diff(
+    diff_a: Iterator[str], diff_b: Iterator[str]
+) -> tuple[str, str, str, str]:
+    """Reorder two sequential diffs (A then B) into four patches for a swap.
+
+    Walks the two opcode streams in lockstep and assigns each non-equal hunk to
+    one of four output patches so that applying patch1..patch4 reproduces the
+    same end state while moving as much of B up above A (and A down below B) as
+    safely possible. Returns (patch1, patch2, patch3, patch4):
+
+      patch1: B hunks that move cleanly above A
+      patch2: A hunks that conflict (stay, before B's conflicting hunks)
+      patch3: B hunks that conflict (stay, after A's conflicting hunks)
+      patch4: A hunks that move cleanly below B
+
+    Each hunk's line numbers are offset (via the running sum1..sum4 net_added
+    totals) so they remain valid once the hunks are emitted in the new order.
+    """
     it_a = opcodes_from_difflines(diff_parser(diff_a))
     it_b = opcodes_from_difflines(diff_parser(diff_b))
     edit_a = next(it_a)
@@ -727,14 +875,11 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
     # When we split edits into the four patches, we need to apply an offset
     # to the line numbers in the hunk headers to take into account that
     # the hunks are now applied in a different order than before.
-    out1offi = 0
-    out1offj = 0
-    out2offi = 0
-    out2offj = 0
-    out3offi = 0
-    out3offj = 0
-    out4offi = 0
-    out4offj = 0
+    # Each sum_i is the sum(edit.net_added() for edit in out_i).
+    sum1 = 0
+    sum2 = 0
+    sum3 = 0
+    sum4 = 0
     while not edit_a.eof or not edit_b.eof:
         # Check if non-equal edit_a's "new range" (j1..j2) fits into equal edit_b's "old range" (i1..i2).
         # Note that if edit_b is at eof, we treat it as a half-open interval (i1..END).
@@ -742,22 +887,15 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
             edit_b.equal
             and not edit_a.equal
             and edit_b.i1 <= edit_a.j1
-            and (edit_b.eof or edit_a.j2 <= edit_b.i2)
+            and (edit_b.eof or (not edit_a.eof and edit_a.j2 <= edit_b.i2))
         ):
             if HTIME_DEBUG:
                 print(
-                    f"out4 {edit_b.i1} <= {edit_a.j1} < {edit_a.j2} <= {edit_b.i2} {repr(edit_a.patchlines()[:60])} {out1offi} {out1offj} {out2offi} {out2offj} {out3offi} {out3offj} {out4offi} {out4offj}"
+                    f"out4 {edit_b.i1} <= {edit_a.j1} < {edit_a.j2} <= {edit_b.i2} {repr(edit_a.patchlines()[:60])} {sum1} {sum2} {sum3} {sum4}"
                 )
             # Put edit_a in the 4th list (moved down below).
-            out4.append(edit_a.offset(out4offi, out4offj))
-            # Stuff that goes in out1,out2,out3 needs to
-            # take into account that this patch is NO LONGER applied,
-            # so their offsets are DECREASED by this hunk's length.
-            out1offi -= edit_a.net_added()
-            out1offj -= edit_a.net_added()
-            out3offi -= edit_a.net_added()
-            out3offj -= edit_a.net_added()
-            out2offj -= edit_a.net_added()
+            out4.append(edit_a.offset(sum1 + sum2 + sum3, -sum2))
+            sum4 += edit_a.net_added()
             edit_a = next(it_a)
         # Check if non-equal edit_b's "old range" (i1..i2) fits into equal edit_a's "new range" (j1..j2).
         # Note that if edit_a is at eof, we treat it as a half-open interval (j1..END).
@@ -765,56 +903,49 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
             edit_a.equal
             and not edit_b.equal
             and edit_a.j1 <= edit_b.i1
-            and (edit_a.eof or edit_b.i2 <= edit_a.j2)
+            and (edit_a.eof or (not edit_b.eof and edit_b.i2 <= edit_a.j2))
         ):
             if HTIME_DEBUG:
                 print(
-                    f"out1 {repr(edit_b.patchlines()[:60])} {out1offi} {out1offj} {out2offi} {out2offj} {out3offi} {out3offj} {out4offi} {out4offj}"
+                    f"out1 {repr(edit_b.patchlines()[:60])} {sum1} {sum2} {sum3} {sum4}"
                 )
             # Put edit_b in the 1st list (moved up above).
-            out1.append(edit_b.offset(out1offi, out1offj))
-            # Stuff that goes in out2,out4 needs to
-            # take into account that this patch is now applied BEFORE,
-            # so their offsets are INCREASED by this hunk's length.
-            out2offi += edit_b.net_added()
-            out2offj += edit_b.net_added()
-            out4offi += edit_b.net_added()
-            out4offj += edit_b.net_added()
+            # This hunk is now applied BEFORE all hunks in out2,3,4,
+            # so subtract those hunks from this hunk.
+            out1.append(edit_b.offset(-sum2 - sum4, -sum3))
+            sum1 += edit_b.net_added()
             edit_b = next(it_b)
         # Check if edit_a's "new range" (j1..j2) ends before edit_b's "old range" (i1..i2)
-        elif edit_b.eof or edit_a.j2 < edit_b.i2:
+        elif edit_b.eof or (not edit_a.eof and edit_a.j2 < edit_b.i2):
             if not edit_a.equal:
                 if HTIME_DEBUG:
                     print(
-                        f"out2 {repr(edit_a.patchlines()[:60])} {out1offi} {out1offj} {out2offi} {out2offj} {out3offi} {out3offj} {out4offi} {out4offj}"
+                        f"out2 {repr(edit_a.patchlines()[:60])} {sum1} {sum2} {sum3} {sum4}"
                     )
                 # Put edit_a in the 2nd list (could not move down).
-                out2.append(edit_a.offset(out2offi, out2offj))
-                # Stuff that goes in out1 needs to take into account
-                # that this patch is now applied AFTER,
-                # so their offsets are DECREASED by this hunk's length.
-                out1offi -= edit_a.net_added()
-                out1offj -= edit_a.net_added()
+                # This hunk is now applied AFTER all hunks in out1,
+                # so add those hunks to this hunk;
+                # also, the hunks moved from this hunk's patch to out4
+                # no longer affect the "new" offset, so subtract those from this hunk's "new" offsets.
+                out2.append(edit_a.offset(sum1, -sum4))
+                sum2 += edit_a.net_added()
+            else:
+                if HTIME_DEBUG:
+                    print(f"plain {edit_a} {edit_b}")
+            assert not edit_a.eof
             edit_a = next(it_a)
         # Check if edit_b's "old range" (i1..i2) ends before edit_a's "new range" (j1..j2)
-        elif edit_a.eof or edit_b.i2 < edit_a.j2:
+        elif edit_a.eof or (not edit_b.eof and edit_b.i2 < edit_a.j2):
             if not edit_b.equal:
                 if HTIME_DEBUG:
                     print(
-                        f"out3 {repr(edit_b.patchlines()[:60])} {out1offi} {out1offj} {out2offi} {out2offj} {out3offi} {out3offj} {out4offi} {out4offj}"
+                        f"out3 {repr(edit_b.patchlines()[:60])} {sum1} {sum2} {sum3} {sum4}"
                     )
                 # Put edit_b in the 3rd list (could not move up).
-                out3.append(edit_b.offset(out3offi, out3offj))
-                # Stuff that goes in out4 needs to take into account
-                # that this patch is now applied BEFORE,
-                # so their offsets are INCREASED by this hunk's length.
-                out4offi += edit_b.net_added()
-                out4offj += edit_b.net_added()
-                # Stuff that goes in out1 needs to take into account
-                # that this patch is now applied AFTER,
-                # so their offsets are DECREASED by this hunk's length.
-                out1offi -= edit_b.net_added()
-                out1offj -= edit_b.net_added()
+                # This hunk is now applied BEFORE all hunks in out4,
+                # so subtract those hunks from this hunk.
+                out3.append(edit_b.offset(sum1 - sum4, -sum1))
+                sum3 += edit_b.net_added()
             edit_b = next(it_b)
         else:
             # Advance both
@@ -823,20 +954,16 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
             assert edit_a.j2 == edit_b.i2
             if HTIME_DEBUG:
                 print(
-                    f"both {repr(edit_a.patchlines()[:60])} {repr(edit_b.patchlines()[:60])} {out1offi} {out1offj} {out2offi} {out2offj} {out3offi} {out3offj} {out4offi} {out4offj}"
+                    f"both {repr(edit_a.patchlines()[:60])} {repr(edit_b.patchlines()[:60])} {sum1} {sum2} {sum3} {sum4}"
                 )
             if not edit_a.equal:
                 # Put edit_a in the 2nd list (could not move down).
-                out2.append(edit_a.offset(out2offi, out2offj))
-                out1offi -= edit_a.net_added()
-                out1offj -= edit_a.net_added()
+                out2.append(edit_a.offset(sum1, -sum4))
+                sum2 += edit_a.net_added()
             if not edit_b.equal:
                 # Put edit_b in the 3rd list (could not move up).
-                out3.append(edit_b.offset(out3offi, out3offj))
-                out4offi += edit_b.net_added()
-                out4offj += edit_b.net_added()
-                out1offi -= edit_b.net_added()
-                out1offj -= edit_b.net_added()
+                out3.append(edit_b.offset(sum1 - sum4, -sum1))
+                sum3 += edit_b.net_added()
             edit_a = next(it_a)
             edit_b = next(it_b)
     # Either out2 and out3 are both empty (everything moved),
@@ -856,7 +983,21 @@ def htime_split_inner(
     secondfiles: list[str],
     bothfiles: list[str],
     conflictpaths: list[str],
-):
+) -> tuple[
+    tuple[str, str] | None,
+    tuple[str, str] | None,
+    tuple[str, str] | None,
+    tuple[str, str] | None,
+]:
+    """Split two commits so they can be swapped; return up to 4 (oid, msg) pairs.
+
+    For paths touched by both commits that would merge-conflict when reordered,
+    runs split_diff() to separate cleanly-movable hunks from conflicting ones,
+    then builds up to four commits representing (B-clean, A-conflict, B-conflict,
+    A-clean). The caller (htime_split / htime_swap) turns the returned
+    (commit_hash, subject) tuples into new todo lines; a slot is None if it had
+    no content. HEAD/index are restored before returning.
+    """
     # Files where we can swap the two commits by relying on ordinary git cherry-pick.
     firstsubj = git_show_commit_subject(firstoid)
     secondsubj = git_show_commit_subject(secondoid)
@@ -964,6 +1105,12 @@ def htime_split_inner(
 
 @subcommand
 def htime_split(first: str, second: str) -> None:
+    """Print replacement todo lines swapping two commits (first, then second).
+
+    If the commits can be reordered safely, emits a trivial swap; otherwise
+    splits conflicting hunks via htime_split_inner and prints the resulting
+    (commented where empty) pick lines.
+    """
     firstfiles = [ns.path for ns in git_show_numstat(first).numstat]
     secondfiles = [ns.path for ns in git_show_numstat(second).numstat]
     bothfiles = [path for path in secondfiles if path in firstfiles]
@@ -1105,4 +1252,7 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--test"]:
+        run_tests()
+    else:
+        main()

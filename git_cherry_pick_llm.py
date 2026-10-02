@@ -112,7 +112,8 @@ def main() -> None:
     for w in agent_work:
         basename = os.path.basename(w.path)
         raw_output, files = llm_single_edit_round(
-            PROMPT.format(basename=basename), {"/mnt/patch": w.the_patch, f"/mnt/input/{basename}": w.the_target}
+            PROMPT.format(basename=basename),
+            {"/mnt/patch": w.the_patch, f"/mnt/input/{basename}": w.the_target},
         )
         if HAMMERTIME_DEBUG:
             with open("git_cherry_pick_llm.txt", "w") as ofp:
