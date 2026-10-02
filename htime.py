@@ -172,7 +172,7 @@ def htime_write_inner(patchlines: str, oidlen: int) -> TodoEdits:
             res = {"justbelow": f"f {hammer1} {subject}".rstrip()}
         # Second hammer commit: reset the index to the original commit's tree
         # and commit it on top of hammer1, so this commit reverts the hand-edits.
-        git_set_staging(commit_hash)
+        git_set_staging(commit_hash, cwd=toplevel)
         git_commit_with_same_authorship(commit_hash)
         git_amend_with_commit_msg(revertsubject)
         hammer2 = git_rev_parse("HEAD")
@@ -916,11 +916,12 @@ def htime_split_inner(
         result2: tuple[str, str] | None = None
         result3: tuple[str, str] | None = None
         result4: tuple[str, str] | None = None
+        toplevel = git_rev_parse_show_toplevel()
         if patch1 or onlysecond or moveboth:
             if patch1:
                 git_apply_cached_unidiff_zero_from_str(patch1)
             if onlysecond:
-                git_set_staging(second_treespec, file_list=onlysecond)
+                git_set_staging(second_treespec, file_list=onlysecond, cwd=toplevel)
             if moveboth:
                 if git_apply_cached_from_git_show(secondoid, file_list=moveboth):
                     raise Exception("unexpected merge conflict (moveboth a)")
@@ -942,7 +943,7 @@ def htime_split_inner(
             if patch4:
                 git_apply_cached_unidiff_zero_from_str(patch4)
             if onlyfirst:
-                git_set_staging(firstoid, file_list=onlyfirst)
+                git_set_staging(firstoid, file_list=onlyfirst, cwd=toplevel)
             if moveboth:
                 if git_apply_cached_from_git_show(firstoid, file_list=moveboth):
                     raise Exception("unexpected merge conflict (moveboth b)")
