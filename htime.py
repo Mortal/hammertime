@@ -581,7 +581,7 @@ class Edit:
 
     @property
     def eof(self) -> bool:
-        """True for the zero-length end-of-diff sentinel Edit."""
+        """An eof Edit means that old[i1:] equals new[j1:]. eof implies equal."""
         if self.i1 == self.i2 and self.j1 == self.j2:
             assert self.fromlines is None
             assert self.tolines is None
@@ -737,13 +737,12 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
     out4offj = 0
     while not edit_a.eof or not edit_b.eof:
         # Check if non-equal edit_a's "new range" (j1..j2) fits into equal edit_b's "old range" (i1..i2).
-        # Note that if any of edit_a or edit_b are at eof, it means the other edit
-        # was NOT inside an equal range, meaning it cannot be moved.
+        # Note that if edit_b is at eof, we treat it as a half-open interval (i1..END).
         if (
-            not edit_a.eof
-            and not edit_b.eof
+            edit_b.equal
             and not edit_a.equal
-            and (edit_b.equal and edit_b.i1 <= edit_a.j1 and edit_a.j2 <= edit_b.i2)
+            and edit_b.i1 <= edit_a.j1
+            and (edit_b.eof or edit_a.j2 <= edit_b.i2)
         ):
             if HTIME_DEBUG:
                 print(
@@ -760,12 +759,13 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
             out3offj -= edit_a.net_added()
             out2offj -= edit_a.net_added()
             edit_a = next(it_a)
-        # Check if non-equal edit_b's "old range" (i1..i2) fits into equal edit_a's "new range" (j1..j2)
+        # Check if non-equal edit_b's "old range" (i1..i2) fits into equal edit_a's "new range" (j1..j2).
+        # Note that if edit_a is at eof, we treat it as a half-open interval (j1..END).
         elif (
-            not edit_a.eof
-            and not edit_b.eof
+            edit_a.equal
             and not edit_b.equal
-            and (edit_a.equal and edit_a.j1 <= edit_b.i1 and edit_b.i2 <= edit_a.j2)
+            and edit_a.j1 <= edit_b.i1
+            and (edit_a.eof or edit_b.i2 <= edit_a.j2)
         ):
             if HTIME_DEBUG:
                 print(
@@ -782,7 +782,7 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
             out4offj += edit_b.net_added()
             edit_b = next(it_b)
         # Check if edit_a's "new range" (j1..j2) ends before edit_b's "old range" (i1..i2)
-        elif edit_b.eof or (not edit_a.eof and edit_a.j2 < edit_b.i2):
+        elif edit_b.eof or edit_a.j2 < edit_b.i2:
             if not edit_a.equal:
                 if HTIME_DEBUG:
                     print(
@@ -797,7 +797,7 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
                 out1offj -= edit_a.net_added()
             edit_a = next(it_a)
         # Check if edit_b's "old range" (i1..i2) ends before edit_a's "new range" (j1..j2)
-        elif edit_a.eof or (not edit_b.eof and edit_b.i2 < edit_a.j2):
+        elif edit_a.eof or edit_b.i2 < edit_a.j2:
             if not edit_b.equal:
                 if HTIME_DEBUG:
                     print(
@@ -839,6 +839,9 @@ def split_diff(diff_a: Iterator[str], diff_b: Iterator[str]):
                 out1offj -= edit_b.net_added()
             edit_a = next(it_a)
             edit_b = next(it_b)
+    # Either out2 and out3 are both empty (everything moved),
+    # or both out2 and out3 are non-empty (two hunks overlap).
+    assert (out2 and out3) or (not out2 and not out3), (len(out2), len(out3))
     patch1 = "".join(e.patchlines() for e in out1)
     patch2 = "".join(e.patchlines() for e in out2)
     patch3 = "".join(e.patchlines() for e in out3)
