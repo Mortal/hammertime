@@ -707,8 +707,8 @@ TESTS = [
     ),
     # Common case: Only near-overlap, no actual overlap.
     (
-        "-A- -A----A- -A-",
-        "- -B--B--B--B---",
+        "-A---A----A---A-",
+        "---B--B--B--B---",
     ),
     # The next tests all start with four B,A,B,A insertions
     # that set the counters to sum1=1, sum2=2, sum3=4, sum4=8,
@@ -716,23 +716,23 @@ TESTS = [
     # are applied correctly.
     (
         " -AA    ---AAAAAAAA-A---",
-        "B-  BBBB---        ---B-",
+        "B-  BBBB---AAAAAAAA---B-",
     ),
     (
         " -AA    ---AAAAAAAA---A-",
-        "B-  BBBB---        -B---",
+        "B-  BBBB---AAAAAAAA-B---",
     ),
     (
         " -AA    ---AAAAAAAA-A-",
-        "B-  BBBB---        ---",
+        "B-  BBBB---AAAAAAAA---",
     ),
     (
         " -AA    ---AAAAAAAA---",
-        "B-  BBBB---        -B-",
+        "B-  BBBB---AAAAAAAA-B-",
     ),
     (
         " -AA    ---AAAAAAAA-AA--A-",
-        "B-  BBBB---        --BB-B-",
+        "B-  BBBB---AAAAAAAA--BB-B-",
     ),
 ]
 
@@ -800,6 +800,11 @@ def run_tests() -> None:
                 v0.append(f"{line}\n")
                 v1.append(f"{line}\n")
                 v2.append(f"{edit}\n")
+            elif pair == ("A", "A"):
+                # Inserted in A, not modified in B
+                line = f"INSERT A {len(v1)}"
+                v1.append(f"{line}\n")
+                v2.append(f"{line}\n")
             elif pair == ("A", " "):
                 # Inserted in A, deleted in B
                 v1.append(f"INSERT A {len(v1)}\n")
@@ -817,28 +822,40 @@ def run_tests() -> None:
         diff_b = "".join(difflib.unified_diff(v1, v2, "a/", "b/"))
         dummy_header = "diff --git dummy\nindex dummy\n"
         # Apply the diff-splitter to obtain four patches p1,p2,p3,p4.
-        p1, p2, p3, p4 = split_diff(
-            f"{dummy_header}{diff_a}".splitlines(True),
-            f"{dummy_header}{diff_b}".splitlines(True),
-        )
+        a_lines = f"{dummy_header}{diff_a}".splitlines(True)
+        b_lines = f"{dummy_header}{diff_b}".splitlines(True)
+        p1, p2, p3, p4 = split_diff(a_lines, b_lines)
         head = f"{dummy_header}--- a/\n+++ b/\n"
         # Apply the patches in order.
         result = v0
+        print("=" * 50)
+        print(line_a)
+        print(line_b)
+        # print(diff_a)
+        # print(diff_b)
+        a_edits = list(opcodes_from_difflines(diff_parser(a_lines)))
+        b_edits = list(opcodes_from_difflines(diff_parser(b_lines)))
+        print("A:", "  ".join(e.range_str() for e in a_edits if not e.equal))
+        print("B:", "  ".join(e.range_str() for e in b_edits if not e.equal))
         if p1:
             p1difflines = list(diff_parser(f"{head}{p1}".splitlines(True)))
             p1edits = list(opcodes_from_difflines(p1difflines))
+            print("p1:", "  ".join(e.range_str() for e in p1edits if not e.equal))
             result = "".join(apply_patch(result, p1edits)).splitlines(True)
         if p2:
             p2difflines = list(diff_parser(f"{head}{p2}".splitlines(True)))
             p2edits = list(opcodes_from_difflines(p2difflines))
+            print("p2:", "  ".join(e.range_str() for e in p2edits if not e.equal))
             result = "".join(apply_patch(result, p2edits)).splitlines(True)
         if p3:
             p3difflines = list(diff_parser(f"{head}{p3}".splitlines(True)))
             p3edits = list(opcodes_from_difflines(p3difflines))
+            print("p3:", "  ".join(e.range_str() for e in p3edits if not e.equal))
             result = "".join(apply_patch(result, p3edits)).splitlines(True)
         if p4:
             p4difflines = list(diff_parser(f"{head}{p4}".splitlines(True)))
             p4edits = list(opcodes_from_difflines(p4difflines))
+            print("p4:", "  ".join(e.range_str() for e in p4edits if not e.equal))
             result = "".join(apply_patch(result, p4edits)).splitlines(True)
         # Ensure that the four patches result in the expected final file.
         assert result == v2
