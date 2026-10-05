@@ -508,6 +508,9 @@ class DiffLine:
     toline: int
 
 
+NO_NEWLINE_MARKER = "\\ No newline at end of file\n"
+
+
 def diff_parser(lines: Iterator[str]) -> Iterator[DiffLine]:
     """Yield a DiffLine for every hunk-body line of a single-file unified diff.
 
@@ -551,6 +554,12 @@ def diff_parser(lines: Iterator[str]) -> Iterator[DiffLine]:
         diffline = next(it, None)
         while fromseen < fromcount or toseen < tocount:
             assert diffline is not None
+            # Peek to handle "no newline at end of file"
+            nextdiffline = next(it, None)
+            if nextdiffline == NO_NEWLINE_MARKER:
+                assert diffline.endswith("\n")
+                diffline = diffline.removesuffix("\n")
+                nextdiffline = next(it, None)
             yield DiffLine(diffline, fromline + fromseen, toline + toseen)
             if diffline.startswith("+"):
                 toseen += 1
@@ -561,7 +570,7 @@ def diff_parser(lines: Iterator[str]) -> Iterator[DiffLine]:
                 toseen += 1
             else:
                 raise Exception(diffline)
-            diffline = next(it, None)
+            diffline = nextdiffline
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -571,6 +580,8 @@ class Edit:
     i2: int
     j1: int
     j2: int
+    # fromlines+tolines contain trailing newlines,
+    # except possibly at the end of the file if the file is missing its final newline.
     fromlines: tuple[str, ...] | None = None
     tolines: tuple[str, ...] | None = None
 
@@ -644,9 +655,21 @@ class Edit:
         """
         if self.fromlines is None or self.tolines is None:
             return ""
-        fromlines = "".join(f"-{line}" for line in self.fromlines)
-        tolines = "".join(f"+{line}" for line in self.tolines)
+        fromlines = "".join(
+            f"-{maybe_no_newline_marker(line)}" for line in self.fromlines
+        )
+        tolines = "".join(f"+{maybe_no_newline_marker(line)}" for line in self.tolines)
         return f"@@ {self.range_str()} @@\n{fromlines}{tolines}"
+
+
+def maybe_no_newline_marker(line: str) -> str:
+    "Insert 'No newline at end of file' marker as needed for a given diffline."
+    nl = line.find("\n")
+    if nl == -1:
+        return f"{line}\n{NO_NEWLINE_MARKER}"
+    elif nl != len(line) - 1:
+        raise Exception("maybe_no_newline_marker: unexpected newline")
+    return line
 
 
 def opcodes_from_difflines(difflines: Iterator[DiffLine]) -> Iterator[Edit]:
