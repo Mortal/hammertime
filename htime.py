@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Safely reorder and hand-edit commits in a git rebase todo list.
 
 See README.md for usage. Designed to be driven by an editor integration
