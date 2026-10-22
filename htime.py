@@ -13,7 +13,7 @@ import subprocess
 import sys
 import textwrap
 from dataclasses import dataclass
-from typing import Iterator, Literal, NotRequired, TypedDict
+from typing import Iterable, Iterator, Literal, NotRequired, TypedDict
 
 from cliparse import make_cliparser
 from hammertime import (
@@ -38,8 +38,11 @@ from hammertime import (
     git_write_tree,
 )
 
+# When set, the split/swap code prints a trace
+# of which output patch each diff hunk is assigned to.
 HTIME_DEBUG = bool(os.environ.get("HTIME_DEBUG"))
 
+# subcommand registers htime_* functions as CLI subcommands; main() dispatches.
 subcommand, main = make_cliparser(__doc__, "htime", "htime_")
 
 
@@ -511,7 +514,7 @@ class DiffLine:
 NO_NEWLINE_MARKER = "\\ No newline at end of file\n"
 
 
-def diff_parser(lines: Iterator[str]) -> Iterator[DiffLine]:
+def diff_parser(lines: Iterable[str]) -> Iterator[DiffLine]:
     """Yield a DiffLine for every hunk-body line of a single-file unified diff.
 
     The input must start with the five header lines ("diff --git", "index",
@@ -577,9 +580,9 @@ def diff_parser(lines: Iterator[str]) -> Iterator[DiffLine]:
 class Edit:
     # old[i1:i2] corresponds to new[j1:j2]
     i1: int
-    i2: int
+    i2: int | None
     j1: int
-    j2: int
+    j2: int | None
     # fromlines+tolines contain trailing newlines,
     # except possibly at the end of the file if the file is missing its final newline.
     fromlines: tuple[str, ...] | None = None
@@ -588,10 +591,12 @@ class Edit:
     @property
     def eof(self) -> bool:
         """An eof Edit means that old[i1:] equals new[j1:]. eof implies equal."""
-        if self.i1 == self.i2 and self.j1 == self.j2:
+        if self.i2 is None:
+            assert self.j2 is None
             assert self.fromlines is None
             assert self.tolines is None
             return True
+        assert self.j2 is not None
         return False
 
     @property
@@ -607,9 +612,9 @@ class Edit:
         """Return a copy with the old/new ranges shifted by the given amounts."""
         result = Edit(
             i1=self.i1 + off,
-            i2=self.i2 + off,
+            i2=None if self.i2 is None else self.i2 + off,
             j1=self.j1 + off + offj,
-            j2=self.j2 + off + offj,
+            j2=None if self.j2 is None else self.j2 + off + offj,
             fromlines=self.fromlines,
             tolines=self.tolines,
         )
@@ -617,6 +622,9 @@ class Edit:
 
     def net_added(self) -> int:
         """Line-count shift this edit introduces (positive = new side is longer)."""
+        if self.i2 is None or self.j2 is None:
+            assert self.eof
+            return 0
         return self.j2 - self.j1 - (self.i2 - self.i1)
 
     def range_str(self) -> str:
@@ -626,17 +634,14 @@ class Edit:
         1-based numbering and the zero-length-range convention, and emits the
         special EOF / `==` forms for eof and equal edits.
         """
-        i1 = self.i1
-        i2 = self.i2
-        j1 = self.j1
-        j2 = self.j2
         # Convert back to 1-based line numbering
-        i1 += 1
-        i2 += 1
-        j1 += 1
-        j2 += 1
-        if self.eof:
+        i1 = self.i1 + 1
+        j1 = self.j1 + 1
+        if self.i2 is None or self.j2 is None:
+            assert self.eof
             return f"-{i1},EOF +{j1},EOF"
+        i2 = self.i2 + 1
+        j2 = self.j2 + 1
         # Convert back to weird zero-length range convention
         if i1 == i2:
             i1 -= 1
@@ -672,7 +677,7 @@ def maybe_no_newline_marker(line: str) -> str:
     return line
 
 
-def opcodes_from_difflines(difflines: Iterator[DiffLine]) -> Iterator[Edit]:
+def opcodes_from_difflines(difflines: Iterable[DiffLine]) -> Iterator[Edit]:
     """Group a DiffLine stream into difflib-opcodes-style Edit records.
 
     Yields one Edit per contiguous equal/change run, ending with a
@@ -718,8 +723,8 @@ def opcodes_from_difflines(difflines: Iterator[DiffLine]) -> Iterator[Edit]:
         )
         i1 += len(fromlines)
         j1 += len(tolines)
-    # Yield special "eof" Edit (two empty ranges old[i1:i1] to new[j1:j1])
-    yield Edit(i1=i1, j1=j1, i2=i1, j2=j1)
+    # Yield special "eof" Edit (two empty ranges old[i1:] to new[j1:])
+    yield Edit(i1=i1, j1=j1, i2=None, j2=None)
 
 
 TESTS = [
@@ -771,11 +776,12 @@ def run_tests() -> None:
     """
     import difflib
 
-    def apply_patch(lines: Iterator[str], edits: Iterator[Edit]) -> Iterator[str]:
+    def apply_patch(lines: Iterable[str], edits: Iterable[Edit]) -> Iterator[str]:
         "Only used for tests: Apply a patch to a file's lines."
         it = iter(lines)
         for edit in edits:
-            if edit.eof:
+            if edit.i2 is None:
+                assert edit.eof
                 yield from it
                 return
             if edit.equal:
@@ -886,7 +892,7 @@ def run_tests() -> None:
 
 
 def split_diff(
-    diff_a: Iterator[str], diff_b: Iterator[str]
+    diff_a: Iterable[str], diff_b: Iterable[str]
 ) -> tuple[str, str, str, str]:
     """Reorder two sequential diffs (A then B) into four patches for a swap.
 
@@ -928,7 +934,9 @@ def split_diff(
             edit_b.equal
             and not edit_a.equal
             and edit_b.i1 <= edit_a.j1
-            and (edit_b.eof or (not edit_a.eof and edit_a.j2 <= edit_b.i2))
+            and (
+                edit_b.i2 is None or (edit_a.j2 is not None and edit_a.j2 <= edit_b.i2)
+            )
         ):
             if HTIME_DEBUG:
                 print(
@@ -944,7 +952,9 @@ def split_diff(
             edit_a.equal
             and not edit_b.equal
             and edit_a.j1 <= edit_b.i1
-            and (edit_a.eof or (not edit_b.eof and edit_b.i2 <= edit_a.j2))
+            and (
+                edit_a.j2 is None or (edit_b.i2 is not None and edit_b.i2 <= edit_a.j2)
+            )
         ):
             if HTIME_DEBUG:
                 print(
@@ -957,7 +967,7 @@ def split_diff(
             sum1 += edit_b.net_added()
             edit_b = next(it_b)
         # Check if edit_a's "new range" (j1..j2) ends before edit_b's "old range" (i1..i2)
-        elif edit_b.eof or (not edit_a.eof and edit_a.j2 < edit_b.i2):
+        elif edit_b.i2 is None or (edit_a.j2 is not None and edit_a.j2 < edit_b.i2):
             if not edit_a.equal:
                 if HTIME_DEBUG:
                     print(
@@ -976,7 +986,7 @@ def split_diff(
             assert not edit_a.eof
             edit_a = next(it_a)
         # Check if edit_b's "old range" (i1..i2) ends before edit_a's "new range" (j1..j2)
-        elif edit_a.eof or (not edit_b.eof and edit_b.i2 < edit_a.j2):
+        elif edit_a.j2 is None or (edit_b.i2 is not None and edit_b.i2 < edit_a.j2):
             if not edit_b.equal:
                 if HTIME_DEBUG:
                     print(
@@ -991,6 +1001,8 @@ def split_diff(
         else:
             # Advance both
             assert not edit_a.eof and not edit_b.eof
+            assert edit_a.j2 is not None
+            assert edit_b.i2 is not None
             # Ensure that edit_a's "new range" (j1..j2) ends at the same place as edit_b's "old range" (i1..i2)
             assert edit_a.j2 == edit_b.i2
             if HTIME_DEBUG:
@@ -1020,10 +1032,10 @@ def split_diff(
 def htime_split_inner(
     firstoid: str,
     secondoid: str,
-    firstfiles: list[str],
-    secondfiles: list[str],
-    bothfiles: list[str],
-    conflictpaths: list[str],
+    firstfiles: list[str] | tuple[str, ...],
+    secondfiles: list[str] | tuple[str, ...],
+    bothfiles: list[str] | tuple[str, ...],
+    conflictpaths: list[str] | tuple[str, ...],
 ) -> tuple[
     tuple[str, str] | None,
     tuple[str, str] | None,
@@ -1039,7 +1051,6 @@ def htime_split_inner(
     (commit_hash, subject) tuples into new todo lines; a slot is None if it had
     no content. HEAD/index are restored before returning.
     """
-    # Files where we can swap the two commits by relying on ordinary git cherry-pick.
     firstsubj = git_show_commit_subject(firstoid)
     secondsubj = git_show_commit_subject(secondoid)
     onlyfirst = [path for path in firstfiles if path not in secondfiles]
