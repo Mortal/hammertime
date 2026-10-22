@@ -2,6 +2,13 @@
 " todo list with htime.py (see README.md). Loaded via :py3file below.
 let s:path = expand('<sfile>:p:h')
 
+py3 <<EOF
+try:
+	import hammertime.vimplugin
+except ImportError:
+	sys.path.append(vim.eval("expand('<sfile>:p:h:h')"))
+	import hammertime.vimplugin
+EOF
 exec 'py3file '..s:path..'/vimplugin.py'
 
 " Open the commit under the cursor in a new scratch buffer for hand-editing.
@@ -43,8 +50,8 @@ endfunction
 
 " Key bindings in gitrebase buffers:
 " <Leader>j/k move the line down/up, Enter edits the commit's diff.
-au FileType gitrebase nnoremap <silent> <buffer> <Leader>j :py3 htime_cmd("move", "down")<CR>
-au FileType gitrebase nnoremap <silent> <buffer> <Leader>k :py3 htime_cmd("move", "up")<CR>
-au FileType gitrebase nnoremap <silent> <buffer> <Leader>J :py3 htime_cmd("swap", "down")<CR>
-au FileType gitrebase nnoremap <silent> <buffer> <Leader>K :py3 htime_cmd("swap", "up")<CR>
+au FileType gitrebase nnoremap <silent> <buffer> <Leader>j :py3 hammertime.vimplugin.htime_cmd("move", "down")<CR>
+au FileType gitrebase nnoremap <silent> <buffer> <Leader>k :py3 hammertime.vimplugin.htime_cmd("move", "up")<CR>
+au FileType gitrebase nnoremap <silent> <buffer> <Leader>J :py3 hammertime.vimplugin.htime_cmd("swap", "down")<CR>
+au FileType gitrebase nnoremap <silent> <buffer> <Leader>K :py3 hammertime.vimplugin.htime_cmd("swap", "up")<CR>
 au FileType gitrebase nnoremap <silent> <buffer> <CR> :call HtimeEdit()<CR>
