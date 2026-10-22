@@ -8,7 +8,7 @@ import json
 import os
 import sys
 import subprocess
-from typing import Any, Literal
+from typing import Any, Literal, TYPE_CHECKING
 
 
 try:
@@ -18,9 +18,7 @@ except NameError:
 this_dir = os.path.dirname(this_file)
 
 
-if "vim" not in globals():
-    # Stand-in for Vim's built-in `vim` module when this file is loaded
-    # outside Vim (e.g. for type checking); calls would fail at runtime.
+if TYPE_CHECKING:
 
     class vim:
         @staticmethod
@@ -34,6 +32,9 @@ if "vim" not in globals():
 
             class window:
                 cursor = (1, 0)
+
+else:
+    import vim
 
 
 def htime_cmd(cmd: Literal["move", "swap"], up_or_down: Literal["down", "up"]) -> None:
