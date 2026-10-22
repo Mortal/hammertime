@@ -409,5 +409,5 @@ def git_show_commit_author_timestamp_and_message(refspec: str) -> tuple[str, str
     time_and_msg = output.split(None, 1)
     if len(time_and_msg) == 1:
         return output.strip(), ""
-    assert len(time_and_msg) == 2
-    return time_and_msg
+    time, msg = time_and_msg
+    return time, msg
