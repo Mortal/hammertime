@@ -21,8 +21,6 @@ def public[T](f: T) -> T:
 
 @dataclass(frozen=True)
 class Numstat:
-    added: int | None
-    removed: int | None
     path: str
 
 
@@ -49,10 +47,7 @@ def _parse_numstat(cmdline: tuple[str, ...]) -> list[CommitNumstat]:
             if "\t" in line:
                 added, removed, path = line.strip().split("\t", 2)
                 assert numstat is not None
-                if added == "-" and removed == "-":
-                    numstat.append(Numstat(None, None, path))
-                else:
-                    numstat.append(Numstat(int(added), int(removed), path))
+                numstat.append(Numstat(path))
             else:
                 assert len(line.strip()) >= 40
                 assert set(line.strip()) <= set(string.hexdigits)
