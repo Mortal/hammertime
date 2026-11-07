@@ -13,6 +13,14 @@ from dataclasses import dataclass
 # Set this env.var to debug what the script is doing in API or git terms:
 DEBUG_GIT_COMMANDS = bool(os.environ.get("DEBUG_GIT_COMMANDS"))
 
+git_env = {
+    **os.environ,
+    "GIT_LITERAL_PATHSPECS": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_PAGER": "cat",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+}
+
 
 def public[T](f: T) -> T:
     """No-op marker decorator identifying a function as part of this module's API."""
@@ -38,7 +46,7 @@ def _parse_numstat(cmdline: tuple[str, ...]) -> list[CommitNumstat]:
     numstat: list[Numstat] | None = None
     result: list[CommitNumstat] = []
     with subprocess.Popen(
-        cmdline, universal_newlines=True, stdout=subprocess.PIPE
+        cmdline, universal_newlines=True, stdout=subprocess.PIPE, env=git_env
     ) as p:
         assert p.stdout
         for line in p.stdout:
@@ -101,7 +109,7 @@ def git_rev_parse(refspec: str) -> str | None:
     cmdline = ["git", "rev-parse", "--quiet", "--verify", "--end-of-options", refspec]
     if DEBUG_GIT_COMMANDS:
         print(*cmdline, flush=True)
-    proc = subprocess.run(cmdline, text=True, stdout=subprocess.PIPE)
+    proc = subprocess.run(cmdline, text=True, stdout=subprocess.PIPE, env=git_env)
     if proc.returncode == 1:
         # Object does not exist
         return None
@@ -120,6 +128,7 @@ def git_write_empty_blob() -> str:
         cmdline,
         universal_newlines=True,
         stdin=subprocess.DEVNULL,
+        env=git_env,
     ).strip()
 
 
@@ -133,6 +142,7 @@ def git_merge_file(*, current: str, base: str, other: str) -> tuple[str, int]:
         universal_newlines=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
+        env=git_env,
     )
     # git merge-file exits 0 on success, 1..127 = number of conflicting
     # hunks, and >127 indicates an error (e.g. a nonexistent object).
@@ -153,6 +163,7 @@ def git_merge_file(*, current: str, base: str, other: str) -> tuple[str, int]:
             universal_newlines=True,
             stdout=subprocess.PIPE,
             stderr=None,
+            env=git_env,
         )
     if not 0 <= p.returncode <= 127:
         p.check_returncode()
@@ -164,7 +175,7 @@ def git_rev_parse_show_toplevel() -> str:
     cmdline = ["git", "rev-parse", "--show-toplevel"]
     if DEBUG_GIT_COMMANDS:
         print("$", *cmdline, flush=True)
-    return subprocess.check_output(cmdline, text=True).rstrip("\n")
+    return subprocess.check_output(cmdline, text=True, env=git_env).rstrip("\n")
 
 
 @public
@@ -172,7 +183,7 @@ def git_write_tree() -> str:
     cmdline = ["git", "write-tree"]
     if DEBUG_GIT_COMMANDS:
         print(*cmdline, flush=True)
-    return subprocess.check_output(cmdline, text=True).rstrip("\n")
+    return subprocess.check_output(cmdline, text=True, env=git_env).rstrip("\n")
 
 
 @public
@@ -180,7 +191,9 @@ def git_files_with_unstaged_changes() -> list[str]:
     cmdline = ["git", "diff", "--name-only", "-z"]
     if DEBUG_GIT_COMMANDS:
         print("$", *cmdline, flush=True)
-    diff_filenames = subprocess.check_output(cmdline, text=True).rstrip("\0")
+    diff_filenames = subprocess.check_output(cmdline, text=True, env=git_env).rstrip(
+        "\0"
+    )
     return diff_filenames.split("\0") if diff_filenames else []
 
 
@@ -189,7 +202,9 @@ def git_files_with_staged_changes() -> list[str]:
     cmdline = ["git", "diff", "--name-only", "-z", "--cached"]
     if DEBUG_GIT_COMMANDS:
         print("$", *cmdline, flush=True)
-    diff_filenames = subprocess.check_output(cmdline, text=True).rstrip("\0")
+    diff_filenames = subprocess.check_output(cmdline, text=True, env=git_env).rstrip(
+        "\0"
+    )
     return diff_filenames.split("\0") if diff_filenames else []
 
 
@@ -198,7 +213,7 @@ def git_any_staged_changes() -> bool:
     cmdline = ["git", "diff", "--quiet", "--cached"]
     if DEBUG_GIT_COMMANDS:
         print(*cmdline, flush=True)
-    proc = subprocess.run(cmdline, check=False)
+    proc = subprocess.run(cmdline, check=False, env=git_env)
     if proc.returncode == 1:
         return True
     proc.check_returncode()
@@ -210,7 +225,7 @@ def git_is_same(refspec1: str, refspec2: str) -> bool:
     cmdline = ["git", "diff", "--quiet", "--end-of-options", refspec1, refspec2]
     if DEBUG_GIT_COMMANDS:
         print(*cmdline, flush=True)
-    proc = subprocess.run(cmdline, check=False)
+    proc = subprocess.run(cmdline, check=False, env=git_env)
     if proc.returncode == 1:
         return False
     proc.check_returncode()
@@ -223,7 +238,7 @@ def git_set_head_and_staging(head: str, staging: str | None) -> None:
         cmdline = ["git", "reset", "-q", head, "--"]
         if DEBUG_GIT_COMMANDS:
             print(*cmdline, flush=True)
-        subprocess.check_call(cmdline)
+        subprocess.check_call(cmdline, env=git_env)
     else:
         git_set_head(head)
         git_set_staging(staging)
@@ -234,7 +249,7 @@ def git_set_head(head: str) -> None:
     cmdline = ["git", "reset", "-q", "--soft", head, "--"]
     if DEBUG_GIT_COMMANDS:
         print(*cmdline, flush=True)
-    subprocess.check_call(cmdline)
+    subprocess.check_call(cmdline, env=git_env)
 
 
 @public
@@ -248,7 +263,7 @@ def git_set_staging(
     cmdline = ["git", "reset", "-q", staging, "--", *(file_list or ["."])]
     if DEBUG_GIT_COMMANDS:
         print(*cmdline, flush=True)
-    subprocess.check_call(cmdline, cwd=cwd)
+    subprocess.check_call(cmdline, cwd=cwd, env=git_env)
 
 
 @public
@@ -261,11 +276,13 @@ def git_apply_cached_from_git_show(
     cmdline1 = ["git", "show", "--end-of-options", refspec, "--", *(file_list or [])]
     if DEBUG_GIT_COMMANDS:
         print(*cmdline1, flush=True)
-    with subprocess.Popen(cmdline1, stdout=subprocess.PIPE, cwd=cwd) as p:
+    with subprocess.Popen(cmdline1, stdout=subprocess.PIPE, cwd=cwd, env=git_env) as p:
         cmdline2 = ["git", "apply", "--allow-empty", "--cached", "-"]
         if DEBUG_GIT_COMMANDS:
             print(*cmdline2, flush=True)
-        proc = subprocess.run(cmdline2, stdin=p.stdout, check=False, cwd=cwd)
+        proc = subprocess.run(
+            cmdline2, stdin=p.stdout, check=False, cwd=cwd, env=git_env
+        )
         p.wait()
         return proc.returncode
 
@@ -279,7 +296,9 @@ def git_apply_cached_unidiff_zero_from_str(
     if DEBUG_GIT_COMMANDS:
         print(*cmdline, flush=True)
     try:
-        subprocess.run(cmdline, input=patch, check=True, cwd=cwd, text=True)
+        subprocess.run(
+            cmdline, input=patch, check=True, cwd=cwd, text=True, env=git_env
+        )
     except subprocess.CalledProcessError:
         print(patch)
         raise
@@ -290,7 +309,7 @@ def git_apply_cached_recount(patch: str, cwd: str | None = None) -> None:
     cmdline = ["git", "apply", "--allow-empty", "--cached", "--recount", "-"]
     if DEBUG_GIT_COMMANDS:
         print(*cmdline, flush=True)
-    subprocess.run(cmdline, text=True, input=patch, check=True, cwd=cwd)
+    subprocess.run(cmdline, text=True, input=patch, check=True, cwd=cwd, env=git_env)
 
 
 @public
@@ -311,7 +330,7 @@ def git_commit_with_same_authorship(
         cmdline += file_list
     if DEBUG_GIT_COMMANDS:
         print(*cmdline, flush=True)
-    subprocess.check_call(cmdline)
+    subprocess.check_call(cmdline, env=git_env)
 
 
 @public
@@ -328,7 +347,7 @@ def git_amend(file_list: list[str] | tuple[str, ...] | None) -> None:
         cmdline += file_list
     if DEBUG_GIT_COMMANDS:
         print(*cmdline, flush=True)
-    subprocess.run(cmdline, text=True, check=True)
+    subprocess.run(cmdline, text=True, check=True, env=git_env)
 
 
 @public
@@ -350,7 +369,7 @@ def git_amend_with_commit_msg(
         cmdline += file_list
     if DEBUG_GIT_COMMANDS:
         print(*cmdline, flush=True)
-    subprocess.run(cmdline, text=True, input=commit_msg, check=True)
+    subprocess.run(cmdline, text=True, input=commit_msg, check=True, env=git_env)
 
 
 @public
@@ -361,7 +380,7 @@ def git_commit_tree(tree: str, message: str, parents: list[str]) -> str:
     if DEBUG_GIT_COMMANDS:
         print(*cmdline, flush=True)
     return subprocess.run(
-        cmdline, input=message, text=True, stdout=subprocess.PIPE
+        cmdline, input=message, text=True, stdout=subprocess.PIPE, env=git_env
     ).stdout.strip()
 
 
@@ -376,7 +395,12 @@ def git_reset_patch_first_hunk(
     if DEBUG_GIT_COMMANDS:
         print(f"printf '%s' {repr(stdin)} |", *cmdline, flush=True)
     subprocess.run(
-        cmdline, input=stdin, text=True, stdout=subprocess.DEVNULL, check=True
+        cmdline,
+        input=stdin,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        check=True,
+        env=git_env,
     )
 
 
@@ -385,7 +409,7 @@ def git_show_commit_subject(refspec: str) -> str:
     cmdline = ["git", "show", "-s", "--pretty=%s", refspec]
     if DEBUG_GIT_COMMANDS:
         print("$", *cmdline, flush=True)
-    output = subprocess.check_output(cmdline, text=True).strip()
+    output = subprocess.check_output(cmdline, text=True, env=git_env).strip()
     return output.strip()
 
 
@@ -400,7 +424,7 @@ def git_show_commit_author_timestamp_and_message(refspec: str) -> tuple[str, str
     cmdline = ["git", "show", "-s", "--pretty=%aI %B", refspec]
     if DEBUG_GIT_COMMANDS:
         print("$", *cmdline, flush=True)
-    output = subprocess.check_output(cmdline, text=True).strip()
+    output = subprocess.check_output(cmdline, text=True, env=git_env).strip()
     time_and_msg = output.split(None, 1)
     if len(time_and_msg) == 1:
         return output.strip(), ""
