@@ -6,6 +6,7 @@ The `htime.py` script can be used on a "git rebase todo list" to edit diffs safe
 * `htime.py update --rebaseline "pick COMMIT" --result "$(htime.py write --rebaseline "pick COMMIT" < patch)" < git-rebase-todo` - update git-rebase-todo, replacing the "pick COMMIT" line with a new line matching the diff in "patch".
 * `htime.py move --lineno N --up-or-down DIR < git-rebase-todo` - update git-rebase-todo, moving the given line (1-indexed) as far up or down as it can go.
 * `htime.py swap --lineno N --up-or-down DIR < git-rebase-todo` - update git-rebase-todo, swapping the given line (1-indexed) with the one above/below as much as possible, breaking commits as needed.
+* `htime.py cherrypick COMMIT [--onto ONTO]` - cherry-pick COMMIT onto the --onto commit (default: HEAD), splitting hunks so as many hunks of COMMIT as possible apply cleanly: prints (with `--onto`) or runs (without `--onto`) the resulting `git cherry-pick` command(s), first the clean hunks, then any conflicting leftovers whose conflicts can be resolved with regular git tools.
 
 The script's command-line interface is designed to be integrated into Vim, but hopefully the interface is general enough that the Vim-specific plugin can be easily ported to another editor.
 

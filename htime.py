@@ -12,19 +12,22 @@ import re
 import subprocess
 import sys
 import textwrap
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Literal, NotRequired, TypedDict
+from typing import Annotated, Literal, NotRequired, TypedDict
 
-from cliparse import make_cliparser
+from cliparse import Pos, make_cliparser
 from hammertime import (
     git_amend_with_commit_msg,
     git_any_staged_changes,
     git_apply_cached_from_git_show,
-    git_apply_cached_unidiff_zero_from_str,
     git_apply_cached_recount,
+    git_apply_cached_unidiff_zero_from_str,
+    git_cherry_pick_in_progress,
     git_commit_with_same_authorship,
     git_files_with_staged_changes,
     git_is_same,
+    git_ls_tree_mode,
     git_merge_file,
     git_rev_parse,
     git_rev_parse_head,
@@ -35,6 +38,8 @@ from hammertime import (
     git_show_commit_message,
     git_show_commit_subject,
     git_show_numstat,
+    git_update_index_blob,
+    git_write_empty_blob,
     git_write_tree,
 )
 
@@ -851,10 +856,10 @@ def run_tests() -> None:
         diff_a = "".join(difflib.unified_diff(v0, v1, "a/", "b/"))
         diff_b = "".join(difflib.unified_diff(v1, v2, "a/", "b/"))
         dummy_header = "diff --git dummy\nindex dummy\n"
-        # Apply the diff-splitter to obtain four patches p1,p2,p3,p4.
+        # Apply the diff-splitter to obtain four patches.
         a_lines = f"{dummy_header}{diff_a}".splitlines(True)
         b_lines = f"{dummy_header}{diff_b}".splitlines(True)
-        p1, p2, p3, p4 = split_diff(a_lines, b_lines)
+        splitres = split_diff(a_lines, b_lines)
         head = f"{dummy_header}--- a/\n+++ b/\n"
         # Apply the patches in order.
         result = v0
@@ -867,23 +872,23 @@ def run_tests() -> None:
         b_edits = list(opcodes_from_difflines(diff_parser(b_lines)))
         print("A:", "  ".join(e.range_str() for e in a_edits if not e.equal))
         print("B:", "  ".join(e.range_str() for e in b_edits if not e.equal))
-        if p1:
-            p1difflines = list(diff_parser(f"{head}{p1}".splitlines(True)))
+        if splitres.patch1:
+            p1difflines = list(diff_parser(f"{head}{splitres.patch1}".splitlines(True)))
             p1edits = list(opcodes_from_difflines(p1difflines))
             print("p1:", "  ".join(e.range_str() for e in p1edits if not e.equal))
             result = "".join(apply_patch(result, p1edits)).splitlines(True)
-        if p2:
-            p2difflines = list(diff_parser(f"{head}{p2}".splitlines(True)))
+        if splitres.patch2:
+            p2difflines = list(diff_parser(f"{head}{splitres.patch2}".splitlines(True)))
             p2edits = list(opcodes_from_difflines(p2difflines))
             print("p2:", "  ".join(e.range_str() for e in p2edits if not e.equal))
             result = "".join(apply_patch(result, p2edits)).splitlines(True)
-        if p3:
-            p3difflines = list(diff_parser(f"{head}{p3}".splitlines(True)))
+        if splitres.patch3:
+            p3difflines = list(diff_parser(f"{head}{splitres.patch3}".splitlines(True)))
             p3edits = list(opcodes_from_difflines(p3difflines))
             print("p3:", "  ".join(e.range_str() for e in p3edits if not e.equal))
             result = "".join(apply_patch(result, p3edits)).splitlines(True)
-        if p4:
-            p4difflines = list(diff_parser(f"{head}{p4}".splitlines(True)))
+        if splitres.patch4:
+            p4difflines = list(diff_parser(f"{head}{splitres.patch4}".splitlines(True)))
             p4edits = list(opcodes_from_difflines(p4difflines))
             print("p4:", "  ".join(e.range_str() for e in p4edits if not e.equal))
             result = "".join(apply_patch(result, p4edits)).splitlines(True)
@@ -891,9 +896,26 @@ def run_tests() -> None:
         assert result == v2
 
 
-def split_diff(
-    diff_a: Iterable[str], diff_b: Iterable[str]
-) -> tuple[str, str, str, str]:
+@dataclass(frozen=True)
+class SplitDiffResult:
+    """Result of split_diff(): the four re-appliable patches, plus raw hunks.
+
+    patch1,patch2,patch3,patch4: The four output patches, to be applied in order.
+    patch3_orig: The non-equal diff_b hunks that went into patch3,
+        *before* their line numbers were adjusted for the reordering, i.e.
+        in the original diff_b line numbering (relative to diff_b's base).
+        These are the diff_b hunks that could not be reordered, useful for
+        building the leftover-hunks commit (see cherrypick_prepare).
+    """
+
+    patch1: str
+    patch2: str
+    patch3: str
+    patch4: str
+    patch3_orig: str
+
+
+def split_diff(diff_a: Iterable[str], diff_b: Iterable[str]) -> SplitDiffResult:
     """Reorder two sequential diffs (A then B) into four patches for a swap.
 
     Walks the two opcode streams in lockstep and assigns each non-equal hunk to
@@ -917,6 +939,7 @@ def split_diff(
     out1: list[Edit] = []  # Edits from B that do not conflict with A
     out2: list[Edit] = []  # Edits from A that have a conflict with B
     out3: list[Edit] = []  # Edits from B that have a conflict with A
+    out3_orig: list[Edit] = []  # Same as out3, without the renumbering offsets
     out4: list[Edit] = []  # Edits from A that do not conflict with B
     # The edits are originally applied in the order of first A, then B.
     # When we split edits into the four patches, we need to apply an offset
@@ -1000,6 +1023,7 @@ def split_diff(
                 # This hunk is now applied BEFORE all hunks in out4,
                 # so subtract those hunks from this hunk.
                 out3.append(edit_b.offset(sum1 - sum4, -sum1))
+                out3_orig.append(edit_b)
                 sum3 += edit_b.net_added()
             edit_b = next(it_b)
         else:
@@ -1021,6 +1045,7 @@ def split_diff(
             if not edit_b.equal:
                 # Put edit_b in the 3rd list (could not move up).
                 out3.append(edit_b.offset(sum1 - sum4, -sum1))
+                out3_orig.append(edit_b)
                 sum3 += edit_b.net_added()
             edit_a = next(it_a)
             edit_b = next(it_b)
@@ -1031,7 +1056,8 @@ def split_diff(
     patch2 = "".join(e.patchlines() for e in out2)
     patch3 = "".join(e.patchlines() for e in out3)
     patch4 = "".join(e.patchlines() for e in out4)
-    return patch1, patch2, patch3, patch4
+    patch3_orig = "".join(e.patchlines() for e in out3_orig)
+    return SplitDiffResult(patch1, patch2, patch3, patch4, patch3_orig)
 
 
 def htime_split_inner(
@@ -1117,18 +1143,18 @@ def htime_split_inner(
                 ):
                     assert first_diff.stdout
                     assert second_diff.stdout
-                    p1, p2, p3, p4 = split_diff(first_diff.stdout, second_diff.stdout)
+                    splitres = split_diff(first_diff.stdout, second_diff.stdout)
                 patchhead = (
                     f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
                 )
-                if p1:
-                    patch1 += f"{patchhead}{p1}"
-                if p2:
-                    patch2 += f"{patchhead}{p2}"
-                if p3:
-                    patch3 += f"{patchhead}{p3}"
-                if p4:
-                    patch4 += f"{patchhead}{p4}"
+                if splitres.patch1:
+                    patch1 += f"{patchhead}{splitres.patch1}"
+                if splitres.patch2:
+                    patch2 += f"{patchhead}{splitres.patch2}"
+                if splitres.patch3:
+                    patch3 += f"{patchhead}{splitres.patch3}"
+                if splitres.patch4:
+                    patch4 += f"{patchhead}{splitres.patch4}"
         # Now create up to four commits, in sequence:
         # - Changes from second that do not have a conflict.
         # - Changes from first that have a conflict.
@@ -1142,7 +1168,7 @@ def htime_split_inner(
         toplevel = git_rev_parse_show_toplevel()
         if patch1 or onlysecond or moveboth:
             if patch1:
-                git_apply_cached_unidiff_zero_from_str(patch1)
+                git_apply_cached_unidiff_zero_from_str(patch1, cwd=toplevel)
             if onlysecond:
                 git_set_staging(second_treespec, file_list=onlysecond, cwd=toplevel)
             if moveboth:
@@ -1154,7 +1180,7 @@ def htime_split_inner(
             result1 = (git_rev_parse_head(), secondsubj)
         if patch2 or fullfile:
             if patch2:
-                git_apply_cached_unidiff_zero_from_str(patch2)
+                git_apply_cached_unidiff_zero_from_str(patch2, cwd=toplevel)
             if fullfile:
                 git_apply_cached_from_git_show(
                     firstoid, file_list=fullfile, cwd=toplevel
@@ -1165,7 +1191,7 @@ def htime_split_inner(
             result2 = (git_rev_parse_head(), commitmsg)
         if patch3 or fullfile:
             if patch3:
-                git_apply_cached_unidiff_zero_from_str(patch3)
+                git_apply_cached_unidiff_zero_from_str(patch3, cwd=toplevel)
             if fullfile:
                 git_apply_cached_from_git_show(
                     secondoid, file_list=fullfile, cwd=toplevel
@@ -1176,7 +1202,7 @@ def htime_split_inner(
             result3 = (git_rev_parse_head(), commitmsg)
         if patch4 or onlyfirst or moveboth:
             if patch4:
-                git_apply_cached_unidiff_zero_from_str(patch4)
+                git_apply_cached_unidiff_zero_from_str(patch4, cwd=toplevel)
             if onlyfirst:
                 git_set_staging(firstoid, file_list=onlyfirst, cwd=toplevel)
             if moveboth:
@@ -1237,6 +1263,176 @@ def htime_split(first: str, second: str) -> None:
         print("# (nothing from 1st commit can move down)")
     else:
         print(f"pick {result4[0][:12]} # {result4[1]}")
+
+
+@dataclass(frozen=True)
+class CherryPickResult:
+    # Paths from A that can be `git checkout`'ed on top of B
+    cleanpaths: list[str] | tuple[str, ...]
+    # (path,blob,mode) of paths from A that were merged by git merge-file
+    mergedpaths: Sequence[tuple[str, str, str]]
+    # unidiff-zero patch that should be applied on top of B
+    shifted: str
+    # unidiff-zero patch that should be applied on top of A^
+    conflicts: str
+
+
+def cherrypick_prepare(
+    aoid: str, boid: str, afiles: list[str] | tuple[str, ...]
+) -> CherryPickResult:
+    "Cherry-pick commit A on top of commit B"
+    empty_blob = git_write_empty_blob()
+    toplevel = git_rev_parse_show_toplevel()
+    cleanpaths: list[str] = []
+    # (path, merged blob oid, mode) for merge-ok and conflicting paths.
+    mergedpaths: list[tuple[str, str, str]] = []
+    shifted = ""  # A's hunks that can be reordered to apply directly on B
+    conflicts = ""  # A's hunks that could not apply, relative to A^
+    for path in afiles:
+        b_blob = git_rev_parse(f"{boid}:{path}")
+        base_blob = git_rev_parse(f"{aoid}^:{path}")
+        if b_blob == base_blob:
+            # B has the same file content as A^, so A's diff applies verbatim.
+            cleanpaths.append(path)
+            continue
+        a_blob = git_rev_parse(f"{aoid}:{path}")
+        if a_blob is None and b_blob is None:
+            # A deletes the file and B already deleted it too.
+            continue
+        merged, nconflicts = git_merge_file(
+            current=f"{boid}:{path}",
+            base=f"{aoid}^:{path}",
+            other=f"{aoid}:{path}",
+        )
+        mode = git_ls_tree_mode(aoid, path, cwd=toplevel) or git_ls_tree_mode(
+            boid, path, cwd=toplevel
+        )
+        assert mode, f"{path} not found in {aoid} nor in {boid}"
+        if not nconflicts:
+            mergedpaths.append((path, merged, mode))
+            continue
+        # Try to reorder the "unrelated" diff B..A^ (diff_a) and A's
+        # actual diff A^..A (diff_b), so that the shifted hunks of A^..A
+        # apply directly on top of B, like htime_split_inner() does for
+        # swapping two commits.
+        if HTIME_DEBUG:
+            print(f"cherrypick split {path}", file=sys.stderr)
+        with (
+            subprocess.Popen(
+                ("git", "diff", b_blob or empty_blob, base_blob or empty_blob),
+                text=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+            ) as unrelated_diff,
+            subprocess.Popen(
+                ("git", "diff", base_blob or empty_blob, a_blob or empty_blob),
+                text=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+            ) as actual_diff,
+        ):
+            assert unrelated_diff.stdout
+            assert actual_diff.stdout
+            splitres = split_diff(unrelated_diff.stdout, actual_diff.stdout)
+        patchhead = f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+        if splitres.patch1:
+            shifted += f"{patchhead}{splitres.patch1}"
+        if splitres.patch3_orig:
+            conflicts += f"{patchhead}{splitres.patch3_orig}"
+    return CherryPickResult(cleanpaths, mergedpaths, shifted, conflicts)
+
+
+def cherrypick_apply(
+    aoid: str, boid: str, r: CherryPickResult
+) -> tuple[str | None, str | None]:
+    if git_any_staged_changes():
+        raise SystemExit("refuse to run when there are staged changes")
+    head_sha = git_rev_parse_head()
+    toplevel = git_rev_parse_show_toplevel()
+    assert aoid
+    assert boid
+    aoid = git_rev_parse(aoid) or ""
+    boid = git_rev_parse(boid) or ""
+    assert aoid
+    assert boid
+    try:
+        conflicts: str | None = None
+        if r.conflicts:
+            git_set_head_and_staging(f"{aoid}^", None)
+            git_apply_cached_unidiff_zero_from_str(r.conflicts, cwd=toplevel)
+            git_commit_with_same_authorship(aoid)
+            conflicts = git_rev_parse_head()
+            if git_is_same(conflicts, aoid):
+                # The cherry-pick reproduces commit A exactly; reuse it.
+                conflicts = aoid
+        # Build the clean cherry-pick commit on top of B.
+        git_set_head_and_staging(boid, None)
+        if r.shifted:
+            git_apply_cached_unidiff_zero_from_str(r.shifted, cwd=toplevel)
+        if r.cleanpaths:
+            git_set_staging(aoid, file_list=r.cleanpaths, cwd=toplevel)
+        for path, oid, mode in r.mergedpaths:
+            git_update_index_blob(path, oid, mode, cwd=toplevel)
+        clean: str | None = None
+        if git_any_staged_changes():
+            git_commit_with_same_authorship(aoid)
+            clean = git_rev_parse_head()
+            if git_is_same(clean, aoid):
+                # The cherry-pick reproduces commit A exactly; reuse it.
+                clean = aoid
+    finally:
+        # Restore the HEAD/index we started from, whatever happened above.
+        git_set_head_and_staging(head_sha, None)
+    return clean, conflicts
+
+
+@subcommand
+def htime_cherrypick(
+    commit: Annotated[str, Pos("COMMIT")],
+    onto: str | None = None,
+) -> None:
+    """Cherry-pick COMMIT onto --onto (default: HEAD), splitting hunks.
+
+    Reorders the "unrelated" diff between --onto and COMMIT^ against the
+    actual COMMIT^..COMMIT changes, so as many hunks of COMMIT as possible
+    apply cleanly on top of --onto, and creates two new commits: one with
+    the hunks that apply cleanly (on top of --onto), and one with the
+    conflicting leftover hunks of COMMIT relative to COMMIT^ (cherry-picking
+    that one will conflict, to be resolved with regular git tools).
+
+    With --onto, prints the "git cherry-pick" command that applies them,
+    instead of running anything. Without --onto, runs it on the current
+    branch, leaving any conflicts from the second cherry-pick for the user
+    to resolve. If nothing conflicts only the clean commit is used, and if
+    nothing can be applied at all a message is printed instead.
+    """
+    aoid = git_rev_parse(commit)
+    assert aoid
+    boid = git_rev_parse(onto or "HEAD")
+    assert boid
+    afiles = [ns.path for ns in git_show_numstat(aoid).numstat]
+    r = cherrypick_prepare(aoid, boid, afiles)
+    clean, conflict = cherrypick_apply(aoid, boid, r)
+    if onto is not None:
+        if clean is not None and conflict is not None:
+            print(f"git cherry-pick {clean} {conflict}")
+        elif clean is not None:
+            print(f"git cherry-pick {clean}")
+        elif conflict is not None:
+            print("No hunks could be applied cleanly")
+        else:
+            print("Nothing to apply")
+        return
+    st = git_cherry_pick_in_progress()
+    if st:
+        print(f"git cherry-pick {clean or ''} {conflict or ''}".strip())
+        raise SystemExit("refuse to operate while cherry-pick is in progress")
+    if clean is not None:
+        subprocess.check_call(("git", "cherry-pick", clean))
+    if conflict is not None:
+        rc = subprocess.call(("git", "cherry-pick", conflict))
+        if rc:
+            subprocess.check_call(("git", "cherry-pick", "--quit"))
 
 
 @subcommand

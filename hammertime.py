@@ -53,7 +53,7 @@ def _parse_numstat(cmdline: tuple[str, ...]) -> list[CommitNumstat]:
             if not line.strip():
                 continue
             if "\t" in line:
-                added, removed, path = line.strip().split("\t", 2)
+                _added, _removed, path = line.strip().split("\t", 2)
                 assert numstat is not None
                 numstat.append(Numstat(path))
             else:
@@ -62,6 +62,41 @@ def _parse_numstat(cmdline: tuple[str, ...]) -> list[CommitNumstat]:
                 numstat = []
                 result.append(CommitNumstat(line.strip().lower(), numstat))
     return result
+
+
+@public
+def git_rev_parse_git_dir() -> str:
+    cmdline = ["git", "rev-parse", "--git-dir"]
+    if DEBUG_GIT_COMMANDS:
+        print("$", *cmdline, flush=True)
+    return subprocess.check_output(cmdline, text=True).rstrip("\n")
+
+
+@public
+def git_cherry_pick_in_progress() -> bool:
+    g = git_rev_parse_git_dir()
+    return os.path.isfile(f"{g}/CHERRY_PICK_HEAD")
+
+
+@public
+def git_sequencer_status() -> str:
+    """Name of the in-progress git operation (rebase/merge/...), or ""."""
+    g = git_rev_parse_git_dir()
+    if os.path.isdir(f"{g}/rebase-merge"):
+        return "rebase"
+    if os.path.isdir(f"{g}/rebase-apply"):
+        return "rebase"
+    if os.path.isfile(f"{g}/MERGE_HEAD"):
+        return "merge"
+    if os.path.isfile(f"{g}/CHERRY_PICK_HEAD"):
+        return "cherry-pick"
+    if os.path.isfile(f"{g}/REVERT_HEAD"):
+        return "revert"
+    if os.path.isfile(f"{g}/sequencer/todo"):
+        return "sequencer"
+    if os.path.isfile(f"{g}/BISECT_LOG"):
+        return "bisect"
+    return ""
 
 
 @public
@@ -168,6 +203,42 @@ def git_merge_file(*, current: str, base: str, other: str) -> tuple[str, int]:
     if not 0 <= p.returncode <= 127:
         p.check_returncode()
     return (p.stdout.strip(), p.returncode)
+
+
+@public
+def git_ls_tree_mode(rev: str, path: str, cwd: str | None = None) -> str | None:
+    """Return the file mode (e.g. "100644") of path in rev, or None if absent.
+
+    The path is relative to the toplevel, so pass cwd=toplevel when running
+    from a subdirectory (git ls-tree pathspecs are relative to the cwd).
+    """
+    cmdline = ["git", "ls-tree", rev, "--", path]
+    if DEBUG_GIT_COMMANDS:
+        print(*cmdline, flush=True)
+    output = subprocess.check_output(cmdline, text=True, cwd=cwd, env=git_env)
+    if not output:
+        return None
+    # Output format: "<mode> <type> <oid>\t<path>"
+    mode = output.split(" ", 1)[0]
+    assert mode in ("100644", "100755", "120000", "160000"), mode
+    return mode
+
+
+@public
+def git_update_index_blob(
+    path: str, blob_oid: str, mode: str, cwd: str | None = None
+) -> None:
+    """Stage a blob's content at path in the index, without touching the worktree."""
+    cmdline = [
+        "git",
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"{mode},{blob_oid},{path}",
+    ]
+    if DEBUG_GIT_COMMANDS:
+        print(*cmdline, flush=True)
+    subprocess.check_call(cmdline, cwd=cwd, env=git_env)
 
 
 @public
