@@ -1058,6 +1058,10 @@ def htime_split_inner(
     """
     firstsubj = git_show_commit_subject(firstoid)
     secondsubj = git_show_commit_subject(secondoid)
+    # This function moves HEAD around; resolve any relative revisions
+    # (e.g. "@^") to absolute oids up front so they stay valid throughout.
+    firstoid = git_rev_parse(firstoid) or firstoid
+    secondoid = git_rev_parse(secondoid) or secondoid
     onlyfirst = [path for path in firstfiles if path not in secondfiles]
     onlysecond = [path for path in secondfiles if path not in firstfiles]
     moveboth = [path for path in bothfiles if path not in conflictpaths]
@@ -1078,35 +1082,53 @@ def htime_split_inner(
         else:
             second_treespec = secondoid
         patch1 = patch2 = patch3 = patch4 = ""
+        # fullfile: Paths with add/delete conflicts (where all edits on the file conflict).
+        fullfile = []
         for path in conflictpaths:
-            if HTIME_DEBUG:
-                print(f"swap {firstoid} {second_treespec} {path}", file=sys.stderr)
-            with (
-                subprocess.Popen(
-                    ("git", "diff", f"{firstoid}^:{path}", f"{firstoid}:{path}"),
-                    text=True,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                ) as first_diff,
-                subprocess.Popen(
-                    ("git", "diff", f"{firstoid}:{path}", f"{second_treespec}:{path}"),
-                    text=True,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                ) as second_diff,
-            ):
-                assert first_diff.stdout
-                assert second_diff.stdout
-                p1, p2, p3, p4 = split_diff(first_diff.stdout, second_diff.stdout)
-            patchhead = f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
-            if p1:
-                patch1 += f"{patchhead}{p1}"
-            if p2:
-                patch2 += f"{patchhead}{p2}"
-            if p3:
-                patch3 += f"{patchhead}{p3}"
-            if p4:
-                patch4 += f"{patchhead}{p4}"
+            first_parent_blob = git_rev_parse(f"{firstoid}^:{path}")
+            first_blob = git_rev_parse(f"{firstoid}:{path}")
+            second_blob = git_rev_parse(f"{second_treespec}:{path}")
+            if not first_parent_blob or not first_blob or not second_blob:
+                if HTIME_DEBUG:
+                    print(
+                        f"fullfile {bool(first_parent_blob)} {bool(first_blob)} {bool(second_blob)} {path}",
+                        file=sys.stderr,
+                    )
+                # not first_parent_blob: Added, then edited -> everything conflicts, nothing can be swapped.
+                # not first_blob: Deleted, then added -> everything conflicts, nothing can be swapped.
+                # not second_blob: Edited, then deleted -> everything conflicts, nothing can be swapped.
+                fullfile.append(path)
+            else:
+                if HTIME_DEBUG:
+                    print(f"split {firstoid} {second_treespec} {path}", file=sys.stderr)
+                with (
+                    subprocess.Popen(
+                        ("git", "diff", first_parent_blob, first_blob),
+                        text=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                    ) as first_diff,
+                    subprocess.Popen(
+                        ("git", "diff", first_blob, second_blob),
+                        text=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                    ) as second_diff,
+                ):
+                    assert first_diff.stdout
+                    assert second_diff.stdout
+                    p1, p2, p3, p4 = split_diff(first_diff.stdout, second_diff.stdout)
+                patchhead = (
+                    f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+                )
+                if p1:
+                    patch1 += f"{patchhead}{p1}"
+                if p2:
+                    patch2 += f"{patchhead}{p2}"
+                if p3:
+                    patch3 += f"{patchhead}{p3}"
+                if p4:
+                    patch4 += f"{patchhead}{p4}"
         # Now create up to four commits, in sequence:
         # - Changes from second that do not have a conflict.
         # - Changes from first that have a conflict.
@@ -1124,18 +1146,30 @@ def htime_split_inner(
             if onlysecond:
                 git_set_staging(second_treespec, file_list=onlysecond, cwd=toplevel)
             if moveboth:
-                if git_apply_cached_from_git_show(secondoid, file_list=moveboth):
+                if git_apply_cached_from_git_show(
+                    secondoid, file_list=moveboth, cwd=toplevel
+                ):
                     raise Exception("unexpected merge conflict (moveboth a)")
             git_commit_with_same_authorship(secondoid)
             result1 = (git_rev_parse_head(), secondsubj)
-        if patch2:
-            git_apply_cached_unidiff_zero_from_str(patch2)
+        if patch2 or fullfile:
+            if patch2:
+                git_apply_cached_unidiff_zero_from_str(patch2)
+            if fullfile:
+                git_apply_cached_from_git_show(
+                    firstoid, file_list=fullfile, cwd=toplevel
+                )
             git_commit_with_same_authorship(firstoid)
             commitmsg = f"Conflicts from: {firstsubj}"
             git_amend_with_commit_msg(commitmsg)
             result2 = (git_rev_parse_head(), commitmsg)
-        if patch3:
-            git_apply_cached_unidiff_zero_from_str(patch3)
+        if patch3 or fullfile:
+            if patch3:
+                git_apply_cached_unidiff_zero_from_str(patch3)
+            if fullfile:
+                git_apply_cached_from_git_show(
+                    secondoid, file_list=fullfile, cwd=toplevel
+                )
             git_commit_with_same_authorship(secondoid)
             commitmsg = f"Conflicts from: {secondsubj}"
             git_amend_with_commit_msg(commitmsg)
@@ -1146,7 +1180,9 @@ def htime_split_inner(
             if onlyfirst:
                 git_set_staging(firstoid, file_list=onlyfirst, cwd=toplevel)
             if moveboth:
-                if git_apply_cached_from_git_show(firstoid, file_list=moveboth):
+                if git_apply_cached_from_git_show(
+                    firstoid, file_list=moveboth, cwd=toplevel
+                ):
                     raise Exception("unexpected merge conflict (moveboth b)")
             git_commit_with_same_authorship(firstoid)
             result4 = (git_rev_parse_head(), firstsubj)
