@@ -940,7 +940,8 @@ def split_diff(
         ):
             if HTIME_DEBUG:
                 print(
-                    f"out4 {edit_b.i1} <= {edit_a.j1} < {edit_a.j2} <= {edit_b.i2} {repr(edit_a.patchlines()[:60])} {sum1} {sum2} {sum3} {sum4}"
+                    f"out4 {edit_b.i1} <= {edit_a.j1} < {edit_a.j2} <= {edit_b.i2} {repr(edit_a.patchlines()[:60])} {sum1} {sum2} {sum3} {sum4}",
+                    file=sys.stderr,
                 )
             # Put edit_a in the 4th list (moved down below).
             out4.append(edit_a.offset(sum1 + sum2 + sum3, -sum2))
@@ -958,7 +959,8 @@ def split_diff(
         ):
             if HTIME_DEBUG:
                 print(
-                    f"out1 {repr(edit_b.patchlines()[:60])} {sum1} {sum2} {sum3} {sum4}"
+                    f"out1 {repr(edit_b.patchlines()[:60])} {sum1} {sum2} {sum3} {sum4}",
+                    file=sys.stderr,
                 )
             # Put edit_b in the 1st list (moved up above).
             # This hunk is now applied BEFORE all hunks in out2,3,4,
@@ -971,7 +973,8 @@ def split_diff(
             if not edit_a.equal:
                 if HTIME_DEBUG:
                     print(
-                        f"out2 {repr(edit_a.patchlines()[:60])} {sum1} {sum2} {sum3} {sum4}"
+                        f"out2 {repr(edit_a.patchlines()[:60])} {sum1} {sum2} {sum3} {sum4}",
+                        file=sys.stderr,
                     )
                 # Put edit_a in the 2nd list (could not move down).
                 # This hunk is now applied AFTER all hunks in out1,
@@ -982,7 +985,7 @@ def split_diff(
                 sum2 += edit_a.net_added()
             else:
                 if HTIME_DEBUG:
-                    print(f"plain {edit_a} {edit_b}")
+                    print(f"plain {edit_a} {edit_b}", file=sys.stderr)
             assert not edit_a.eof
             edit_a = next(it_a)
         # Check if edit_b's "old range" (i1..i2) ends before edit_a's "new range" (j1..j2)
@@ -990,7 +993,8 @@ def split_diff(
             if not edit_b.equal:
                 if HTIME_DEBUG:
                     print(
-                        f"out3 {repr(edit_b.patchlines()[:60])} {sum1} {sum2} {sum3} {sum4}"
+                        f"out3 {repr(edit_b.patchlines()[:60])} {sum1} {sum2} {sum3} {sum4}",
+                        file=sys.stderr,
                     )
                 # Put edit_b in the 3rd list (could not move up).
                 # This hunk is now applied BEFORE all hunks in out4,
@@ -1007,7 +1011,8 @@ def split_diff(
             assert edit_a.j2 == edit_b.i2
             if HTIME_DEBUG:
                 print(
-                    f"both {repr(edit_a.patchlines()[:60])} {repr(edit_b.patchlines()[:60])} {sum1} {sum2} {sum3} {sum4}"
+                    f"both {repr(edit_a.patchlines()[:60])} {repr(edit_b.patchlines()[:60])} {sum1} {sum2} {sum3} {sum4}",
+                    file=sys.stderr,
                 )
             if not edit_a.equal:
                 # Put edit_a in the 2nd list (could not move down).
@@ -1075,7 +1080,7 @@ def htime_split_inner(
         patch1 = patch2 = patch3 = patch4 = ""
         for path in conflictpaths:
             if HTIME_DEBUG:
-                print(f"swap {firstoid} {second_treespec} {path}")
+                print(f"swap {firstoid} {second_treespec} {path}", file=sys.stderr)
             with (
                 subprocess.Popen(
                     ("git", "diff", f"{firstoid}^:{path}", f"{firstoid}:{path}"),
@@ -1247,7 +1252,15 @@ def htime_swap(lineno: int, up_or_down: Literal["down", "up"]) -> None:
     bothfiles = [path for path in secondfiles if path in firstfiles]
     conflictmessage = move_conflict(up_or_down, targetline.oid, line.oid, bothfiles)
     if HTIME_DEBUG:
-        print("move", up_or_down, targetline.oid, line.oid, bothfiles, conflictmessage)
+        print(
+            "move",
+            up_or_down,
+            targetline.oid,
+            line.oid,
+            bothfiles,
+            conflictmessage,
+            file=sys.stderr,
+        )
     if conflictmessage is None:
         print(json.dumps({"movelines": 1}))
         return
